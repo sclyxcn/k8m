@@ -29,13 +29,13 @@ on:
   workflow_dispatch:
     inputs:
       sync_mode_override:
-        description: '🔁 同步模式'
+        description: '🔁 同步模式（选下拉框）'
         required: false
-        default: 'force'
+        default: 'force - 强制删除后重建'
         type: choice
         options:
-          - 'force'
-          - 'incremental'
+          - 'force - 强制删除后重建'
+          - 'incremental - 增量保留已有'
       sync_latest_only:
         description: '📌 只同步最新版本（同时清理旧版）'
         required: false
@@ -148,7 +148,7 @@ jobs:
           echo "上游仓库: ${UPSTREAM:-未检测到}"
           echo "触发方式: ${{ github.event_name }}"
           echo "------------------------------------------"
-          echo "同步模式: ${{ github.event.inputs.sync_mode_override || env.SYNC_MODE }}（force=强制重建，incremental=增量保留）"
+          echo "同步模式: ${{ github.event.inputs.sync_mode_override || env.SYNC_MODE }}"
           echo "只同步最新版本: ${{ github.event.inputs.sync_latest_only || env.SYNC_LATEST_ONLY }}（true=只同步最新并清理旧版，false=同步全部）"
           echo "跳过代码同步: ${{ github.event.inputs.skip_code_sync || env.SKIP_CODE_SYNC }}"
           echo "跳过Release同步: ${{ github.event.inputs.skip_release_sync || env.SKIP_RELEASE_SYNC }}"
@@ -520,6 +520,12 @@ jobs:
           echo "=========================================="
           echo "📦 同步 Releases"
           echo "=========================================="
+          # 兼容 "force" 和 "force - 强制删除后重建" 两种格式
+          case "$SYNC_MODE" in
+            force*) SYNC_MODE="force" ;;
+            incremental*) SYNC_MODE="incremental" ;;
+            *) SYNC_MODE="force" ;;
+          esac
           echo "同步模式: $SYNC_MODE"
           echo "Release 数量: $RELEASE_COUNT"
           echo "Tag 目标 SHA（本地 HEAD）: $TARGET_SHA"
