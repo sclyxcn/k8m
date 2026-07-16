@@ -68,6 +68,7 @@ jobs:
     
     permissions:
       contents: write
+      actions: write
     
     concurrency:
       group: sync-upstream
@@ -158,25 +159,31 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          # 配置 Git 使用 GITHUB_TOKEN 认证
+          git config --global http.https://github.com/.extraheader "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}"
           echo "✅ Git 配置完成"
 
       # ============================================
-      # 步骤5: 添加上游仓库
+      # 步骤5: 添加上游仓库（只获取 Tags，不同步 workflows）
       # ============================================
       - name: 🔗 添加上游仓库
         run: |
           UPSTREAM_REPO="${{ steps.detect_upstream.outputs.upstream_repo }}"
-          UPSTREAM_URL="https://${{ secrets.GITHUB_TOKEN }}@github.com/${UPSTREAM_REPO}.git"
+          UPSTREAM_URL="https://github.com/${UPSTREAM_REPO}.git"
           
           echo "上游仓库: $UPSTREAM_REPO"
           git remote add upstream $UPSTREAM_URL || git remote set-url upstream $UPSTREAM_URL
           
+          # 【关键】只 fetch tags，不 fetch 代码，避免 workflows 文件
           git fetch upstream --tags --prune --force
           
           echo "✅ 上游仓库添加成功"
+          echo ""
+          echo "📌 上游 Tags:"
+          git ls-remote --tags upstream | grep -v '\^{}' | tail -5
 
       # ============================================
-      # 步骤6: 禁用上游 Actions
+      # 步骤6: 禁用上游 Actions（如果有）
       # ============================================
       - name: 🚫 禁用上游 Actions
         if: github.event.inputs.disable_upstream_actions == 'true'
@@ -235,7 +242,7 @@ jobs:
           echo "📊 上游总 Release 数量: $TOTAL_COUNT"
           
           if [ "$TOTAL_COUNT" -eq 0 ]; then
-            echo "⚠️ 上游没有 Release，跳过同步"
+            echo "⚠️ 上游没有 Release"
             echo "release_count=0" >> $GITHUB_OUTPUT
             exit 0
           fi
@@ -254,7 +261,7 @@ jobs:
           echo "release_count=$RELEASE_COUNT" >> $GITHUB_OUTPUT
 
       # ============================================
-      # 步骤8: 同步 Releases
+      # 步骤8: 同步 Releases（通过 API，不涉及 workflows）
       # ============================================
       - name: 📦 同步 Releases 与制品
         id: sync_releases
@@ -275,11 +282,6 @@ jobs:
           echo "Release 数量: $RELEASE_COUNT"
           echo "=========================================="
           
-          if [ "$RELEASE_COUNT" -eq 0 ]; then
-            echo "⚠️ 没有 Release 需要同步"
-            exit 0
-          fi
-          
           RELEASES=$(cat /tmp/upstream_releases.json)
           
           echo "$RELEASES" | jq -c '.[]' | while read release; do
@@ -297,19 +299,44 @@ jobs:
             echo "   制品数量: $ASSET_COUNT"
             echo "=========================================="
             
-            # --- 处理 Tag ---
-            if git rev-parse "refs/tags/$TAG_NAME" >/dev/null 2>&1; then
-              git tag -d "$TAG_NAME"
+            # --- 【关键】只创建 Tag，不包含 workflows ---
+            # 使用 API 创建 Tag（不会触发 workflows 权限问题）
+            echo "   📌 通过 API 创建/更新 Tag..."
+            
+            # 获取上游 Tag 的 commit SHA
+            # 首先获取上游仓库的默认分支最新 commit
+            DEFAULT_BRANCH=$(git remote show upstream | grep 'HEAD branch' | cut -d' ' -f5)
+            TARGET_SHA=$(git rev-parse upstream/$DEFAULT_BRANCH)
+            
+            # 使用 API 创建 Tag（引用）
+            # 先检查 Tag 是否存在
+            TAG_EXISTS=$(curl -s -o /dev/null -w "%{http_code}" \
+              -H "Authorization: token $GITHUB_TOKEN" \
+              "https://api.github.com/repos/$CURRENT_REPO/git/refs/tags/$TAG_NAME")
+            
+            if [ "$TAG_EXISTS" == "200" ]; then
+              echo "   ⚠️ Tag 已存在，更新指向..."
+              # 更新 Tag 引用
+              curl -s -X PATCH \
+                -H "Authorization: token $GITHUB_TOKEN" \
+                -H "Content-Type: application/json" \
+                -d "{
+                  \"sha\": \"$TARGET_SHA\",
+                  \"force\": true
+                }" \
+                "https://api.github.com/repos/$CURRENT_REPO/git/refs/tags/$TAG_NAME" > /dev/null
+            else
+              # 创建 Tag 引用
+              curl -s -X POST \
+                -H "Authorization: token $GITHUB_TOKEN" \
+                -H "Content-Type: application/json" \
+                -d "{
+                  \"ref\": \"refs/tags/$TAG_NAME\",
+                  \"sha\": \"$TARGET_SHA\"
+                }" \
+                "https://api.github.com/repos/$CURRENT_REPO/git/refs" > /dev/null
             fi
-            
-            git fetch upstream "refs/tags/$TAG_NAME:refs/tags/$TAG_NAME" --force
-            
-            git push origin "refs/tags/$TAG_NAME" -f --no-verify || {
-              CURRENT_SHA=$(git rev-parse HEAD)
-              git tag -f "$TAG_NAME" "$CURRENT_SHA"
-              git push origin "refs/tags/$TAG_NAME" -f --no-verify
-            }
-            echo "   ✅ Tag 推送成功"
+            echo "   ✅ Tag 创建/更新成功"
             
             # --- 处理 Release ---
             RELEASE_EXISTS=$(curl -s -o /dev/null -w "%{http_code}" \
@@ -319,10 +346,12 @@ jobs:
             if [ "$RELEASE_EXISTS" == "200" ]; then
               echo "   ⚠️ Release 已存在"
               if [ "$SYNC_MODE" == "force" ]; then
+                echo "   🔄 强制模式：删除并重建 Release..."
                 RELEASE_ID=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
                   "https://api.github.com/repos/$CURRENT_REPO/releases/tags/$TAG_NAME" | jq -r '.id')
                 curl -X DELETE -s -H "Authorization: token $GITHUB_TOKEN" \
                   "https://api.github.com/repos/$CURRENT_REPO/releases/$RELEASE_ID"
+                echo "   ✅ Release 已删除"
                 RELEASE_EXISTS="404"
               fi
             fi
@@ -363,6 +392,7 @@ jobs:
               
               [ -z "$ASSET_NAME" ] || [ "$ASSET_NAME" == "null" ] && continue
               
+              # 跳过源码包
               if [[ "$ASSET_NAME" == *"Source code"* ]] || [[ "$ASSET_NAME" == *"源码"* ]]; then
                 echo "     ⏭️ 跳过源码包: $ASSET_NAME"
                 continue
@@ -384,13 +414,10 @@ jobs:
           
           echo ""
           echo "✅ 所有 Release 同步完成"
-          
-          # 标记同步成功
           echo "sync_success=true" >> $GITHUB_OUTPUT
 
       # ============================================
-      # 步骤9: 【修复】清理旧 Tags 和 Releases（只保留最新）
-      # 只在同步成功后才执行
+      # 步骤9: 清理旧 Tags 和 Releases（只保留最新）
       # ============================================
       - name: 🧹 清理旧 Tags 和 Releases（只保留最新）
         id: cleanup
@@ -408,115 +435,58 @@ jobs:
           
           CURRENT_REPO="${{ github.repository }}"
           
-          # 获取上游最新的 Tag
-          LATEST_TAG=$(git ls-remote --tags upstream | grep -v '\^{}' | sort -V | tail -n1 | awk -F'/' '{print $NF}')
-          
-          if [ -z "$LATEST_TAG" ]; then
-            echo "⚠️ 无法获取最新 Tag，跳过清理"
-            exit 0
-          fi
-          
-          echo "📌 最新 Tag: $LATEST_TAG"
-          
-          # --- 1. 检查本地是否有 Tag ---
-          LOCAL_TAGS=$(git tag -l)
-          
-          if [ -z "$LOCAL_TAGS" ]; then
-            echo "📌 没有本地 Tags，跳过清理"
-            exit 0
-          fi
-          
-          # --- 2. 检查最新 Tag 是否存在 ---
-          if ! git rev-parse "refs/tags/$LATEST_TAG" >/dev/null 2>&1; then
-            echo "⚠️ 最新 Tag $LATEST_TAG 在本地不存在，跳过清理"
-            exit 0
-          fi
-          
-          echo ""
-          echo "📌 清理本地 Tags..."
-          
-          DELETED_TAG_COUNT=0
-          KEPT_TAG_COUNT=0
-          
-          for tag in $LOCAL_TAGS; do
-            # 检查本地 Tag 是否存在
-            if ! git rev-parse "refs/tags/$tag" >/dev/null 2>&1; then
-              continue
-            fi
-            
-            if [ "$tag" == "$LATEST_TAG" ]; then
-              echo "   ✅ 保留（最新）: $tag"
-              KEPT_TAG_COUNT=$((KEPT_TAG_COUNT + 1))
-            else
-              echo "   🗑️ 删除 Tag: $tag"
-              git tag -d "$tag" 2>/dev/null || true
-              DELETED_TAG_COUNT=$((DELETED_TAG_COUNT + 1))
-              
-              # 删除远程 Tag（如果存在）
-              if git ls-remote --tags origin "$tag" 2>/dev/null | grep -q "$tag"; then
-                echo "      📤 删除远程 Tag: $tag"
-                git push origin --delete "$tag" 2>/dev/null || true
-              fi
-            fi
-          done
-          
-          echo ""
-          echo "📌 清理 Tags 完成"
-          echo "   保留: $KEPT_TAG_COUNT (最新: $LATEST_TAG)"
-          echo "   删除: $DELETED_TAG_COUNT"
-          
-          # --- 3. 清理 Releases ---
-          echo ""
-          echo "📌 清理 Releases..."
-          
           # 获取当前仓库的所有 Release
           RELEASES=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
             "https://api.github.com/repos/$CURRENT_REPO/releases?per_page=100")
           
           TOTAL_COUNT=$(echo "$RELEASES" | jq '. | length')
           
-          if [ "$TOTAL_COUNT" -eq 0 ]; then
-            echo "📌 没有 Release"
-          elif [ "$TOTAL_COUNT" -eq 1 ]; then
-            LATEST_RELEASE_TAG=$(echo "$RELEASES" | jq -r '.[0].tag_name')
-            echo "📌 只有 1 个 Release: $LATEST_RELEASE_TAG，无需清理"
-          else
-            echo "📊 当前 Release 数量: $TOTAL_COUNT"
-            
-            # 获取最新的 Release（第一个）
-            LATEST_RELEASE_TAG=$(echo "$RELEASES" | jq -r '.[0].tag_name')
-            LATEST_RELEASE_ID=$(echo "$RELEASES" | jq -r '.[0].id')
-            
-            echo "📌 最新 Release: $LATEST_RELEASE_TAG"
-            echo ""
-            echo "将要删除的旧 Release:"
-            
-            DELETED_RELEASE_COUNT=0
-            
-            echo "$RELEASES" | jq -c '.[]' | while read release; do
-              TAG_NAME=$(echo $release | jq -r '.tag_name')
-              RELEASE_ID=$(echo $release | jq -r '.id')
-              
-              if [ "$RELEASE_ID" != "$LATEST_RELEASE_ID" ]; then
-                echo "   🗑️ 删除 Release: $TAG_NAME"
-                curl -X DELETE -s -H "Authorization: token $GITHUB_TOKEN" \
-                  "https://api.github.com/repos/$CURRENT_REPO/releases/$RELEASE_ID"
-                DELETED_RELEASE_COUNT=$((DELETED_RELEASE_COUNT + 1))
-              fi
-            done
-            
-            echo ""
-            echo "📌 清理 Releases 完成"
-            echo "   保留: 1 (最新: $LATEST_RELEASE_TAG)"
-            echo "   删除: $DELETED_RELEASE_COUNT"
+          if [ "$TOTAL_COUNT" -le 1 ]; then
+            echo "📌 Release 数量: $TOTAL_COUNT，无需清理"
+            exit 0
           fi
           
+          echo "📊 当前 Release 数量: $TOTAL_COUNT"
+          
+          # 获取最新的 Release（第一个）
+          LATEST_RELEASE_TAG=$(echo "$RELEASES" | jq -r '.[0].tag_name')
+          LATEST_RELEASE_ID=$(echo "$RELEASES" | jq -r '.[0].id')
+          
+          echo "📌 最新 Release: $LATEST_RELEASE_TAG"
           echo ""
-          echo "=========================================="
+          echo "将要删除的旧 Release:"
+          
+          DELETED_RELEASE_COUNT=0
+          DELETED_TAG_COUNT=0
+          
+          echo "$RELEASES" | jq -c '.[]' | while read release; do
+            TAG_NAME=$(echo $release | jq -r '.tag_name')
+            RELEASE_ID=$(echo $release | jq -r '.id')
+            
+            if [ "$RELEASE_ID" != "$LATEST_RELEASE_ID" ]; then
+              echo "   🗑️ 删除: $TAG_NAME"
+              
+              # 删除 Release
+              curl -X DELETE -s -H "Authorization: token $GITHUB_TOKEN" \
+                "https://api.github.com/repos/$CURRENT_REPO/releases/$RELEASE_ID"
+              DELETED_RELEASE_COUNT=$((DELETED_RELEASE_COUNT + 1))
+              
+              # 删除对应的 Tag
+              if git rev-parse "refs/tags/$TAG_NAME" >/dev/null 2>&1; then
+                git tag -d "$TAG_NAME" 2>/dev/null || true
+                # 通过 API 删除 Tag 引用
+                curl -X DELETE -s -H "Authorization: token $GITHUB_TOKEN" \
+                  "https://api.github.com/repos/$CURRENT_REPO/git/refs/tags/$TAG_NAME" 2>/dev/null || true
+                DELETED_TAG_COUNT=$((DELETED_TAG_COUNT + 1))
+              fi
+            fi
+          done
+          
+          echo ""
           echo "✅ 清理完成"
-          echo "=========================================="
-          echo "📌 最终保留: $LATEST_TAG"
-          echo "=========================================="
+          echo "   删除旧 Release: $DELETED_RELEASE_COUNT"
+          echo "   删除旧 Tag: $DELETED_TAG_COUNT"
+          echo "   保留最新: $LATEST_RELEASE_TAG"
 
       # ============================================
       # 步骤10: 验证
