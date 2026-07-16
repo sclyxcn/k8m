@@ -1,0 +1,572 @@
+# ============================================================
+# 配置区域 - UPSTREAM_REPO 现在会自动检测，无需手动配置！
+# ============================================================
+
+name: Sync Upstream & Keep Alive
+
+# ============================================================
+# 环境变量配置
+# ============================================================
+env:
+  # 【可选】如果自动检测失败，可以手动指定上游仓库
+  # 格式: "owner/repo"，留空则自动检测
+  UPSTREAM_REPO: ""  # 留空 = 自动检测
+  
+  # 同步模式: "incremental"（增量） 或 "force"（强制覆盖）
+  SYNC_MODE: "incremental"
+  
+  # 合并策略: "ours"（保留本地）或 "theirs"（使用上游）
+  MERGE_STRATEGY: "ours"
+  
+  # 只同步最新的 Release
+  SYNC_LATEST_ONLY: "true"
+  
+  # 任务超时时间（分钟）
+  JOB_TIMEOUT_MINUTES: "30"
+
+# ============================================================
+# 触发器配置
+# ============================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      sync_mode_override:
+        description: '🔁 覆盖同步模式'
+        required: false
+        default: ''
+        type: choice
+        options:
+          - ''
+          - 'incremental'
+          - 'force'
+      sync_latest_only:
+        description: '📌 只同步最新 Release'
+        required: false
+        default: 'true'
+        type: boolean
+      skip_code_sync:
+        description: '⏭️ 跳过代码同步'
+        required: false
+        default: 'false'
+        type: boolean
+      skip_release_sync:
+        description: '⏭️ 跳过 Release 同步'
+        required: false
+        default: 'false'
+        type: boolean
+      disable_upstream_actions:
+        description: '🚫 禁用上游仓库的 Actions（谨慎使用）'
+        required: false
+        default: 'false'
+        type: boolean
+  
+  schedule:
+    - cron: "0 3 */5 * *"
+
+# ============================================================
+# 任务配置
+# ============================================================
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    permissions:
+      contents: write
+      actions: write
+      issues: write
+      pull-requests: write
+    
+    concurrency:
+      group: sync-upstream
+      cancel-in-progress: false
+
+    steps:
+      # ============================================
+      # 步骤1: 检出复刻仓库
+      # ============================================
+      - name: 📥 检出复刻仓库
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+          persist-credentials: true
+
+      # ============================================
+      # 步骤2: 【核心】自动检测上游仓库
+      # ============================================
+      - name: 🔍 自动检测上游仓库
+        id: detect_upstream
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          echo "=========================================="
+          echo "🔍 自动检测上游仓库"
+          echo "=========================================="
+          
+          # 如果用户手动指定了 UPSTREAM_REPO，使用手动配置
+          MANUAL_UPSTREAM="${{ env.UPSTREAM_REPO }}"
+          
+          if [ -n "$MANUAL_UPSTREAM" ] && [ "$MANUAL_UPSTREAM" != "" ]; then
+            echo "📌 使用手动配置的上游仓库: $MANUAL_UPSTREAM"
+            echo "upstream_repo=$MANUAL_UPSTREAM" >> $GITHUB_OUTPUT
+            echo "detected=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # 通过 GitHub API 获取仓库信息
+          CURRENT_REPO="${{ github.repository }}"
+          echo "当前仓库: $CURRENT_REPO"
+          
+          REPO_INFO=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+            "https://api.github.com/repos/$CURRENT_REPO")
+          
+          # 检查是否是复刻仓库
+          IS_FORK=$(echo "$REPO_INFO" | jq -r '.fork')
+          
+          if [ "$IS_FORK" != "true" ]; then
+            echo "⚠️ 警告: 当前仓库不是复刻仓库"
+            echo "请手动设置 UPSTREAM_REPO 环境变量"
+            echo "upstream_repo=" >> $GITHUB_OUTPUT
+            echo "detected=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+          
+          # 获取父仓库信息
+          PARENT_REPO=$(echo "$REPO_INFO" | jq -r '.parent.full_name')
+          
+          if [ -z "$PARENT_REPO" ] || [ "$PARENT_REPO" == "null" ]; then
+            echo "❌ 无法获取父仓库信息"
+            echo "请手动设置 UPSTREAM_REPO 环境变量"
+            echo "upstream_repo=" >> $GITHUB_OUTPUT
+            echo "detected=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+          
+          echo "✅ 自动检测到上游仓库: $PARENT_REPO"
+          echo "upstream_repo=$PARENT_REPO" >> $GITHUB_OUTPUT
+          echo "detected=true" >> $GITHUB_OUTPUT
+
+      # ============================================
+      # 步骤3: 显示配置信息
+      # ============================================
+      - name: 📋 显示配置信息
+        run: |
+          UPSTREAM="${{ steps.detect_upstream.outputs.upstream_repo }}"
+          
+          echo "=========================================="
+          echo "📋 同步配置信息"
+          echo "=========================================="
+          echo "当前仓库: ${{ github.repository }}"
+          echo "上游仓库: ${UPSTREAM:-未检测到}"
+          echo "检测状态: ${{ steps.detect_upstream.outputs.detected }}"
+          echo "同步模式: ${{ env.SYNC_MODE }}"
+          echo "合并策略: ${{ env.MERGE_STRATEGY }}"
+          echo "只同步最新: ${{ github.event.inputs.sync_latest_only || env.SYNC_LATEST_ONLY }}"
+          echo "禁用上游Actions: ${{ github.event.inputs.disable_upstream_actions || 'false' }}"
+          echo "定时计划: 0 3 */5 * * (每5天凌晨3点)"
+          echo "=========================================="
+          
+          if [ -z "$UPSTREAM" ]; then
+            echo "❌ 错误: 未检测到上游仓库"
+            echo "请手动在 env.UPSTREAM_REPO 中配置"
+            exit 1
+          fi
+
+      # ============================================
+      # 步骤4: 配置 Git
+      # ============================================
+      - name: ⚙️ 配置 Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          echo "✅ Git 配置完成"
+
+      # ============================================
+      # 步骤5: 添加上游仓库（使用自动检测的地址）
+      # ============================================
+      - name: 🔗 添加上游仓库
+        run: |
+          UPSTREAM_REPO="${{ steps.detect_upstream.outputs.upstream_repo }}"
+          TOKEN="${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}"
+          UPSTREAM_URL="https://${TOKEN}@github.com/${UPSTREAM_REPO}.git"
+          
+          echo "上游仓库: $UPSTREAM_REPO"
+          echo "添加远程仓库..."
+          git remote add upstream $UPSTREAM_URL || git remote set-url upstream $UPSTREAM_URL
+          
+          git fetch upstream --tags --prune
+          git fetch upstream --prune
+          
+          echo "✅ 上游仓库添加成功"
+
+      # ============================================
+      # 步骤6: 禁用上游 Actions（安全模式）
+      # ============================================
+      - name: 🚫 禁用上游 Actions（安全模式）
+        if: github.event.inputs.disable_upstream_actions == 'true'
+        run: |
+          echo "=========================================="
+          echo "🚫 禁用上游仓库的 Actions（安全模式）"
+          echo "=========================================="
+          
+          CURRENT_WORKFLOW="sync-upstream.yml"
+          
+          if [ ! -d ".github/workflows" ]; then
+            echo "⚠️ .github/workflows 目录不存在，跳过"
+            exit 0
+          fi
+          
+          echo "发现 .github/workflows 目录"
+          echo "当前目录内容:"
+          ls -la .github/workflows/
+          
+          # 定义要删除的特定上游 Actions 文件列表
+          UPSTREAM_ACTIONS_TO_DELETE="
+            build-docker-image.yml
+            build-release.yml
+            release-drafter.yml
+            sync-releases.yml
+            release.yml
+            docker-build.yml
+            ci.yml
+            test.yml
+            deploy.yml
+          "
+          
+          DELETED_COUNT=0
+          
+          find .github/workflows -name "*.yml" -o -name "*.yaml" | while read file; do
+            filename=$(basename "$file")
+            should_delete=false
+            
+            echo "$UPSTREAM_ACTIONS_TO_DELETE" | while read target; do
+              if [ -n "$target" ] && [ "$filename" == "$target" ]; then
+                should_delete=true
+                break
+              fi
+            done
+            
+            # 保护当前工作流（绝对不能删除）
+            if [ "$filename" == "$CURRENT_WORKFLOW" ]; then
+              should_delete=false
+              echo "   🔒 保护当前工作流: $file"
+            fi
+            
+            if [ "$should_delete" == "true" ]; then
+              echo "   🗑️ 删除: $file"
+              rm -f "$file"
+              DELETED_COUNT=$((DELETED_COUNT + 1))
+            else
+              if [ "$filename" != "$CURRENT_WORKFLOW" ]; then
+                echo "   ⏭️ 保留: $file"
+              fi
+            fi
+          done
+          
+          echo "删除文件数: $DELETED_COUNT"
+          
+          if git status --porcelain | grep -q ".github/workflows"; then
+            git add .github/workflows/
+            git commit -m "[skip ci] 禁用上游 Actions（安全模式）"
+            git push origin $(git branch --show-current)
+            echo "✅ 更改已提交"
+          else
+            echo "✅ 没有需要删除的 Actions"
+          fi
+
+      # ============================================
+      # 步骤7: 合并上游代码
+      # ============================================
+      - name: 🔄 合并上游代码
+        id: merge
+        if: github.event.inputs.skip_code_sync != 'true'
+        run: |
+          CURRENT_BRANCH=$(git branch --show-current)
+          echo "当前分支: $CURRENT_BRANCH"
+          
+          UPSTREAM_BRANCH=$(git remote show upstream | grep 'HEAD branch' | cut -d' ' -f5)
+          echo "上游默认分支: $UPSTREAM_BRANCH"
+          
+          MERGE_STRATEGY="${{ env.MERGE_STRATEGY }}"
+          echo "合并策略: $MERGE_STRATEGY"
+          
+          git pull upstream $UPSTREAM_BRANCH --no-edit || {
+            echo "合并冲突，使用 $MERGE_STRATEGY 策略..."
+            git pull upstream $UPSTREAM_BRANCH -X recursive -X $MERGE_STRATEGY --no-edit || {
+              echo "❌ 合并失败"
+              exit 1
+            }
+          }
+          
+          git push origin $CURRENT_BRANCH
+          echo "merge_success=true" >> $GITHUB_OUTPUT
+          echo "✅ 代码同步完成"
+
+      # ============================================
+      # 步骤8: 检查上游 Release
+      # ============================================
+      - name: 🔍 检查上游 Release
+        id: check_releases
+        if: github.event.inputs.skip_release_sync != 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          UPSTREAM_REPO="${{ steps.detect_upstream.outputs.upstream_repo }}"
+          SYNC_LATEST_ONLY="${{ github.event.inputs.sync_latest_only || env.SYNC_LATEST_ONLY }}"
+          
+          echo "=========================================="
+          echo "🔍 检查上游仓库: $UPSTREAM_REPO"
+          echo "只同步最新: $SYNC_LATEST_ONLY"
+          echo "=========================================="
+          
+          REPO_CHECK=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            "https://api.github.com/repos/$UPSTREAM_REPO")
+          
+          if [ "$REPO_CHECK" != "200" ]; then
+            echo "❌ 上游仓库不存在！HTTP: $REPO_CHECK"
+            exit 1
+          fi
+          echo "✅ 上游仓库可访问"
+          
+          ALL_RELEASES=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+            "https://api.github.com/repos/$UPSTREAM_REPO/releases?per_page=100")
+          
+          TOTAL_COUNT=$(echo "$ALL_RELEASES" | jq '. | length')
+          echo "📊 上游总 Release 数量: $TOTAL_COUNT"
+          
+          if [ "$TOTAL_COUNT" -eq 0 ]; then
+            echo "⚠️ 上游仓库没有 Release"
+            echo "release_count=0" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          if [ "$SYNC_LATEST_ONLY" == "true" ]; then
+            RELEASES=$(echo "$ALL_RELEASES" | jq '[.[0]]')
+            RELEASE_COUNT=1
+            echo "📌 最新 Release: $(echo "$RELEASES" | jq -r '.[0].tag_name')"
+          else
+            RELEASES="$ALL_RELEASES"
+            RELEASE_COUNT="$TOTAL_COUNT"
+            echo "📌 所有 Release:"
+            echo "$RELEASES" | jq -r '.[] | "   - \(.tag_name)"'
+          fi
+          
+          echo "$RELEASES" > /tmp/upstream_releases.json
+          echo "release_count=$RELEASE_COUNT" >> $GITHUB_OUTPUT
+
+      # ============================================
+      # 步骤9: 同步 Releases
+      # ============================================
+      - name: 📦 同步 Releases 与制品
+        if: github.event.inputs.skip_release_sync != 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          
+          SYNC_MODE="${{ github.event.inputs.sync_mode_override || env.SYNC_MODE }}"
+          CURRENT_REPO="${{ github.repository }}"
+          RELEASE_COUNT="${{ steps.check_releases.outputs.release_count }}"
+          
+          echo "=========================================="
+          echo "📦 开始同步 Releases"
+          echo "=========================================="
+          echo "同步模式: $SYNC_MODE"
+          echo "Release 数量: $RELEASE_COUNT"
+          echo "=========================================="
+          
+          if [ "$RELEASE_COUNT" -eq 0 ]; then
+            echo "⚠️ 没有 Release 需要同步"
+            exit 0
+          fi
+          
+          RELEASES=$(cat /tmp/upstream_releases.json)
+          git fetch --tags origin
+          LOCAL_TAGS=$(git tag -l)
+          
+          echo "$RELEASES" | jq -c '.[]' | while read release; do
+            TAG_NAME=$(echo $release | jq -r '.tag_name')
+            RELEASE_NAME=$(echo $release | jq -r '.name')
+            BODY=$(echo $release | jq -r '.body')
+            PRERELEASE=$(echo $release | jq -r '.prerelease')
+            TARGET_SHA=$(echo $release | jq -r '.target_commitish')
+            PUBLISHED_AT=$(echo $release | jq -r '.published_at')
+            
+            echo ""
+            echo "=========================================="
+            echo "📌 处理 Release: $TAG_NAME"
+            echo "   发布时间: $PUBLISHED_AT"
+            echo "=========================================="
+            
+            if echo "$LOCAL_TAGS" | grep -q "^$TAG_NAME$"; then
+              echo "   ✅ Tag 已存在"
+            else
+              echo "   📌 创建 Tag"
+              if [ "$TARGET_SHA" == "null" ] || [ -z "$TARGET_SHA" ]; then
+                DEFAULT_BRANCH=$(git remote show upstream | grep 'HEAD branch' | cut -d' ' -f5)
+                TARGET_SHA=$(git rev-parse upstream/$DEFAULT_BRANCH)
+              fi
+              git tag "$TAG_NAME" "$TARGET_SHA"
+              git push origin "$TAG_NAME"
+              echo "   ✅ Tag 已创建"
+            fi
+            
+            RELEASE_EXISTS=$(curl -s -o /dev/null -w "%{http_code}" \
+              -H "Authorization: token $GITHUB_TOKEN" \
+              "https://api.github.com/repos/$CURRENT_REPO/releases/tags/$TAG_NAME")
+            
+            if [ "$RELEASE_EXISTS" == "200" ]; then
+              echo "   ✅ Release 已存在"
+              if [ "$SYNC_MODE" == "force" ]; then
+                echo "   强制模式：清理现有制品..."
+                LOCAL_RELEASE_ID=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+                  "https://api.github.com/repos/$CURRENT_REPO/releases/tags/$TAG_NAME" | jq -r '.id')
+                ASSETS=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+                  "https://api.github.com/repos/$CURRENT_REPO/releases/$LOCAL_RELEASE_ID/assets" | jq -r '.[].id')
+                for ASSET_ID in $ASSETS; do
+                  curl -X DELETE -s -H "Authorization: token $GITHUB_TOKEN" \
+                    "https://api.github.com/repos/$CURRENT_REPO/releases/assets/$ASSET_ID"
+                done
+                echo "   ✅ 制品已清理"
+              fi
+            else
+              echo "   📌 创建 Release"
+              RELEASE_BODY=$(echo "$BODY" | jq -R -s '.')
+              [ "$RELEASE_BODY" == "null" ] && RELEASE_BODY='""'
+              RELEASE_NAME_JSON=$(echo "$RELEASE_NAME" | jq -R -s '.')
+              [ "$RELEASE_NAME_JSON" == "null" ] && RELEASE_NAME_JSON='""'
+              
+              RESPONSE=$(curl -s -X POST -w "\n%{http_code}" \
+                -H "Authorization: token $GITHUB_TOKEN" \
+                -H "Content-Type: application/json" \
+                -d "{
+                  \"tag_name\": \"$TAG_NAME\",
+                  \"name\": $RELEASE_NAME_JSON,
+                  \"body\": $RELEASE_BODY,
+                  \"prerelease\": $PRERELEASE
+                }" \
+                "https://api.github.com/repos/$CURRENT_REPO/releases")
+              
+              HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+              if [ "$HTTP_CODE" == "201" ]; then
+                echo "   ✅ Release 创建成功"
+              else
+                echo "   ❌ Release 创建失败 (HTTP $HTTP_CODE)"
+                exit 1
+              fi
+            fi
+            
+            ASSETS=$(echo $release | jq -c '.assets[]')
+            [ -z "$ASSETS" ] || [ "$ASSETS" == "null" ] && continue
+            
+            echo "$ASSETS" | while read asset; do
+              ASSET_NAME=$(echo $asset | jq -r '.name')
+              ASSET_URL=$(echo $asset | jq -r '.browser_download_url')
+              ASSET_SIZE=$(echo $asset | jq -r '.size')
+              ASSET_SIZE_HR=$(numfmt --to=iec $ASSET_SIZE 2>/dev/null || echo "$ASSET_SIZE bytes")
+              
+              [ -z "$ASSET_NAME" ] || [ "$ASSET_NAME" == "null" ] && continue
+              
+              if [ "$SYNC_MODE" == "incremental" ] && [ "$RELEASE_EXISTS" == "200" ]; then
+                EXISTING=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+                  "https://api.github.com/repos/$CURRENT_REPO/releases/tags/$TAG_NAME" | jq -r ".assets[] | select(.name==\"$ASSET_NAME\") | .name")
+                if [ "$EXISTING" == "$ASSET_NAME" ]; then
+                  echo "     ✅ 跳过: $ASSET_NAME ($ASSET_SIZE_HR)"
+                  continue
+                fi
+              fi
+              
+              echo "     📥 下载: $ASSET_NAME ($ASSET_SIZE_HR)"
+              wget -q --tries=3 --timeout=300 "$ASSET_URL" -O "$ASSET_NAME" || {
+                echo "     ❌ 下载失败，跳过"
+                continue
+              }
+              
+              echo "     📤 上传: $ASSET_NAME"
+              gh release upload "$TAG_NAME" "$ASSET_NAME" --clobber --repo "$CURRENT_REPO"
+              
+              rm -f "$ASSET_NAME"
+              echo "     ✅ 上传完成"
+            done
+          done
+          
+          echo ""
+          echo "✅ 所有 Release 同步完成"
+
+      # ============================================
+      # 步骤10: 清理
+      # ============================================
+      - name: 🧹 清理
+        run: |
+          git remote prune upstream
+          git fetch --all --prune
+
+      # ============================================
+      # 步骤11: 仓库保活
+      # ============================================
+      - name: 💚 仓库保活
+        id: keepalive
+        run: |
+          echo "=========================================="
+          echo "💚 执行仓库保活"
+          echo "=========================================="
+          
+          CURRENT_TIME=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          echo "当前时间: $CURRENT_TIME"
+          echo "下次定时执行: $(date -u -d '5 days' '+%Y-%m-%d %H:%M:%S UTC')"
+          
+          LAST_COMMIT_MSG=$(git log -1 --pretty=%B)
+          
+          if [[ "$LAST_COMMIT_MSG" == *"[skip ci] keepalive"* ]]; then
+            echo "最近提交已是保活提交，跳过"
+          else
+            echo "创建保活空提交..."
+            git commit --allow-empty -m "[skip ci] keepalive: 仓库保活 $(date -u '+%Y-%m-%d')"
+            git push origin $(git branch --show-current)
+            echo "✅ 保活提交已推送"
+          fi
+          
+          echo "✅ 仓库保活完成"
+
+      # ============================================
+      # 步骤12: 验证
+      # ============================================
+      - name: ✅ 验证同步结果
+        if: github.event.inputs.skip_release_sync != 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          echo "=========================================="
+          echo "✅ 验证同步结果"
+          echo "=========================================="
+          
+          CURRENT_REPO="${{ github.repository }}"
+          
+          RELEASES=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+            "https://api.github.com/repos/$CURRENT_REPO/releases?per_page=100")
+          
+          RELEASE_COUNT=$(echo "$RELEASES" | jq '. | length')
+          echo "📊 当前仓库 Release 数量: $RELEASE_COUNT"
+          
+          if [ "$RELEASE_COUNT" -gt 0 ]; then
+            echo "📌 当前 Release 列表:"
+            echo "$RELEASES" | jq -r '.[] | "   - \(.tag_name) - 制品数: \(.assets | length)"'
+          fi
+
+      # ============================================
+      # 步骤13: 结果
+      # ============================================
+      - name: 📢 执行结果
+        if: always()
+        run: |
+          if [ "${{ job.status }}" == "success" ]; then
+            echo "🎉 同步任务执行成功！"
+            echo "📌 下次自动执行: $(date -u -d '5 days' '+%Y-%m-%d %H:%M:%S UTC')"
+          else
+            echo "❌ 同步任务执行失败，请检查上方日志"
+            exit 1
+          fi
