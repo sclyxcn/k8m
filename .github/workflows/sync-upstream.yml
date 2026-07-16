@@ -71,6 +71,7 @@ jobs:
       actions: write
       pull-requests: write
       issues: write
+      workflows: write
     
     concurrency:
       group: sync-upstream
