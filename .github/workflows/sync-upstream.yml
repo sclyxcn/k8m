@@ -1,5 +1,5 @@
 # ============================================================
-# 配置区域 - UPSTREAM_REPO 自动检测
+# 配置区域 - 自动检测上游仓库
 # ============================================================
 
 name: Sync Upstream & Keep Alive
@@ -55,9 +55,9 @@ on:
         default: 'false'
         type: boolean
       disable_upstream_actions:
-        description: '🚫 禁用上游仓库的 Actions'
+        description: '🚫 禁用上游仓库的 Actions（默认启用）'
         required: false
-        default: 'false'
+        default: 'true'
         type: boolean
   
   schedule:
@@ -153,6 +153,7 @@ jobs:
           echo "上游仓库: ${UPSTREAM:-未检测到}"
           echo "同步模式: ${{ env.SYNC_MODE }}"
           echo "只同步最新: ${{ github.event.inputs.sync_latest_only || env.SYNC_LATEST_ONLY }}"
+          echo "禁用上游Actions: ${{ github.event.inputs.disable_upstream_actions || 'true' }}"
           echo "=========================================="
           
           if [ -z "$UPSTREAM" ]; then
@@ -167,10 +168,13 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # 配置 Git 自动处理 tag 冲突：强制覆盖
+          git config --global tag.forceSignAnnotated false
           echo "✅ Git 配置完成"
 
       # ============================================
-      # 步骤5: 添加上游仓库
+      # 步骤5: 添加上游仓库（强制覆盖 Tags）
       # ============================================
       - name: 🔗 添加上游仓库
         run: |
@@ -181,73 +185,99 @@ jobs:
           echo "上游仓库: $UPSTREAM_REPO"
           git remote add upstream $UPSTREAM_URL || git remote set-url upstream $UPSTREAM_URL
           
-          git fetch upstream --tags --prune
+          # 获取上游所有 tags，强制覆盖本地
+          git fetch upstream --tags --prune --force
           git fetch upstream --prune
           
           echo "✅ 上游仓库添加成功"
 
       # ============================================
-      # 步骤6: 禁用上游 Actions
+      # 步骤6: 禁用上游 Actions（改为 .disabled 后缀，不删除）
       # ============================================
       - name: 🚫 禁用上游 Actions
         if: github.event.inputs.disable_upstream_actions == 'true'
         run: |
           echo "=========================================="
-          echo "🚫 禁用上游 Actions"
+          echo "🚫 禁用上游 Actions（重命名为 .disabled）"
           echo "=========================================="
-          
-          CURRENT_WORKFLOW="sync-upstream.yml"
           
           if [ ! -d ".github/workflows" ]; then
             echo "⚠️ .github/workflows 目录不存在"
             exit 0
           fi
           
-          UPSTREAM_ACTIONS_TO_DELETE="
-            build-docker-image.yml
-            build-release.yml
-            release-drafter.yml
-            sync-releases.yml
-            release.yml
-            docker-build.yml
-            ci.yml
-            test.yml
-            deploy.yml
-          "
+          # 获取当前工作流文件名（从 GITHUB_WORKFLOW 环境变量）
+          CURRENT_WORKFLOW="${{ github.workflow }}"
+          # 转换为文件名格式
+          CURRENT_WORKFLOW_FILE="${CURRENT_WORKFLOW// /-}.yml"
+          # 也检查常见的命名
+          SAFE_NAMES="sync-upstream.yml sync-upstream.yaml"
           
-          find .github/workflows -name "*.yml" -o -name "*.yaml" | while read file; do
+          echo "当前工作流: $CURRENT_WORKFLOW"
+          echo "当前工作流文件: $CURRENT_WORKFLOW_FILE"
+          echo "保护的文件: $SAFE_NAMES"
+          echo ""
+          
+          DISABLED_COUNT=0
+          KEPT_COUNT=0
+          
+          # 遍历所有 .yml 和 .yaml 文件
+          find .github/workflows -maxdepth 1 -name "*.yml" -o -name "*.yaml" | while read file; do
             filename=$(basename "$file")
-            should_delete=false
             
-            echo "$UPSTREAM_ACTIONS_TO_DELETE" | while read target; do
-              if [ -n "$target" ] && [ "$filename" == "$target" ]; then
-                should_delete=true
+            # 检查是否是当前工作流文件（绝对不能禁用）
+            is_safe=false
+            
+            # 检查是否在安全列表中
+            for safe_name in $SAFE_NAMES; do
+              if [ "$filename" == "$safe_name" ]; then
+                is_safe=true
                 break
               fi
             done
             
-            if [ "$filename" == "$CURRENT_WORKFLOW" ]; then
-              should_delete=false
-              echo "   🔒 保护: $file"
+            # 也检查是否匹配当前工作流文件名
+            if [ "$filename" == "$CURRENT_WORKFLOW_FILE" ]; then
+              is_safe=true
             fi
             
-            if [ "$should_delete" == "true" ]; then
-              echo "   🗑️ 删除: $file"
-              rm -f "$file"
+            if [ "$is_safe" == "true" ]; then
+              echo "   🔒 保护: $file"
+              KEPT_COUNT=$((KEPT_COUNT + 1))
+              continue
             fi
+            
+            # 检查是否已经被禁用了（.disabled 后缀）
+            if [[ "$filename" == *.disabled ]]; then
+              echo "   ⏭️ 已禁用: $file"
+              continue
+            fi
+            
+            # 重命名为 .disabled
+            new_file="${file}.disabled"
+            echo "   🚫 禁用: $file → $new_file"
+            mv "$file" "$new_file"
+            DISABLED_COUNT=$((DISABLED_COUNT + 1))
           done
           
+          echo ""
+          echo "禁用文件数: $DISABLED_COUNT"
+          echo "保留文件数: $KEPT_COUNT"
+          
+          # 提交更改
           if git status --porcelain | grep -q ".github/workflows"; then
+            echo ""
+            echo "提交更改..."
             git add .github/workflows/
-            git commit -m "[skip ci] 禁用上游 Actions"
+            git commit -m "[skip ci] 禁用上游 Actions（重命名为 .disabled）"
             git push origin $(git branch --show-current)
-            echo "✅ 已提交"
+            echo "✅ 更改已提交"
           else
-            echo "✅ 无变更"
+            echo "✅ 没有需要禁用的 Actions"
           fi
 
       # ============================================
-      # 步骤7: 合并上游代码
+      # 步骤7: 合并上游代码（强制覆盖 Tags）
       # ============================================
       - name: 🔄 合并上游代码
         id: merge
@@ -269,8 +299,10 @@ jobs:
             }
           }
           
+          # 强制推送所有 tags（覆盖冲突）
+          git push origin --tags -f
           git push origin $CURRENT_BRANCH
-          echo "✅ 代码同步完成"
+          echo "✅ 代码和 Tags 同步完成"
 
       # ============================================
       # 步骤8: 检查上游 Release
@@ -325,7 +357,7 @@ jobs:
           echo "release_count=$RELEASE_COUNT" >> $GITHUB_OUTPUT
 
       # ============================================
-      # 步骤9: 同步 Releases（强制覆盖 Tag）
+      # 步骤9: 同步 Releases（强制覆盖）
       # ============================================
       - name: 📦 同步 Releases 与制品
         if: github.event.inputs.skip_release_sync != 'true'
@@ -351,8 +383,10 @@ jobs:
           fi
           
           RELEASES=$(cat /tmp/upstream_releases.json)
-          git fetch --tags origin
-          LOCAL_TAGS=$(git tag -l)
+          
+          # 先强制拉取所有 tags
+          git fetch upstream --tags --prune --force
+          git fetch origin --tags --prune --force
           
           echo "$RELEASES" | jq -c '.[]' | while read release; do
             TAG_NAME=$(echo $release | jq -r '.tag_name')
@@ -368,23 +402,26 @@ jobs:
             echo "   发布时间: $PUBLISHED_AT"
             echo "=========================================="
             
-            # --- 处理 Tag（使用 -f 强制覆盖） ---
-            if echo "$LOCAL_TAGS" | grep -q "^$TAG_NAME$"; then
-              echo "   ⚠️ Tag 已存在，强制更新..."
-              # 删除本地 Tag 再重新创建，确保指向正确的 commit
-              git tag -d "$TAG_NAME" 2>/dev/null || true
-            else
-              echo "   📌 创建新 Tag"
+            # --- 处理 Tag（强制覆盖） ---
+            # 获取上游 Tag 的 commit SHA
+            UPSTREAM_TAG_SHA=$(git rev-parse "refs/remotes/upstream/tags/$TAG_NAME" 2>/dev/null || echo "")
+            
+            if [ -n "$UPSTREAM_TAG_SHA" ]; then
+              echo "   📌 上游 Tag SHA: $UPSTREAM_TAG_SHA"
             fi
             
-            if [ "$TARGET_SHA" == "null" ] || [ -z "$TARGET_SHA" ]; then
-              DEFAULT_BRANCH=$(git remote show upstream | grep 'HEAD branch' | cut -d' ' -f5)
-              TARGET_SHA=$(git rev-parse upstream/$DEFAULT_BRANCH)
+            # 删除本地 Tag（如果存在），然后重新创建
+            if git rev-parse "refs/tags/$TAG_NAME" >/dev/null 2>&1; then
+              echo "   ⚠️ 本地 Tag 已存在，强制覆盖..."
+              git tag -d "$TAG_NAME"
             fi
             
-            # 创建 Tag 并强制推送
-            git tag "$TAG_NAME" "$TARGET_SHA"
-            git push origin "$TAG_NAME" -f
+            # 从上游直接获取 Tag
+            git fetch upstream "refs/tags/$TAG_NAME:refs/tags/$TAG_NAME" --force
+            echo "   ✅ Tag 已同步"
+            
+            # 强制推送 Tag 到 origin
+            git push origin "refs/tags/$TAG_NAME" -f
             echo "   ✅ Tag 已强制推送"
             
             # --- 处理 Release ---
@@ -395,7 +432,6 @@ jobs:
             if [ "$RELEASE_EXISTS" == "200" ]; then
               echo "   ✅ Release 已存在"
               
-              # 强制模式：清理现有制品
               if [ "$SYNC_MODE" == "force" ]; then
                 echo "   强制模式：清理现有制品..."
                 LOCAL_RELEASE_ID=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
@@ -448,7 +484,6 @@ jobs:
               
               [ -z "$ASSET_NAME" ] || [ "$ASSET_NAME" == "null" ] && continue
               
-              # 增量模式：跳过已存在的制品
               if [ "$SYNC_MODE" == "incremental" ] && [ "$RELEASE_EXISTS" == "200" ]; then
                 EXISTING=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
                   "https://api.github.com/repos/$CURRENT_REPO/releases/tags/$TAG_NAME" | jq -r ".assets[] | select(.name==\"$ASSET_NAME\") | .name")
@@ -481,7 +516,7 @@ jobs:
       - name: 🧹 清理
         run: |
           git remote prune upstream
-          git fetch --all --prune
+          git fetch --all --prune --force
 
       # ============================================
       # 步骤11: 仓库保活
