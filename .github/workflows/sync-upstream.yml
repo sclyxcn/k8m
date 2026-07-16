@@ -84,7 +84,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ github.token }}
           persist-credentials: true
 
       # ============================================
@@ -93,7 +93,7 @@ jobs:
       - name: 🔍 自动检测上游仓库
         id: detect_upstream
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           echo "=========================================="
           echo "🔍 自动检测上游仓库"
@@ -169,7 +169,7 @@ jobs:
       - name: 🔗 添加上游仓库
         run: |
           UPSTREAM_REPO="${{ steps.detect_upstream.outputs.upstream_repo }}"
-          UPSTREAM_URL="https://${{ secrets.GITHUB_TOKEN }}@github.com/${UPSTREAM_REPO}.git"
+          UPSTREAM_URL="https://${{ github.token }}@github.com/${UPSTREAM_REPO}.git"
           
           echo "上游仓库: $UPSTREAM_REPO"
           git remote add upstream $UPSTREAM_URL || git remote set-url upstream $UPSTREAM_URL
@@ -192,7 +192,7 @@ jobs:
       - name: 🔍 获取上游 commit SHA
         id: get_sha
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           UPSTREAM_REPO="${{ steps.detect_upstream.outputs.upstream_repo }}"
 
@@ -327,7 +327,7 @@ jobs:
         id: check_releases
         if: github.event.inputs.skip_release_sync != 'true'
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           UPSTREAM_REPO="${{ steps.detect_upstream.outputs.upstream_repo }}"
           SYNC_LATEST_ONLY="${{ github.event.inputs.sync_latest_only || env.SYNC_LATEST_ONLY }}"
@@ -387,16 +387,14 @@ jobs:
           echo "release_count=$RELEASE_COUNT" >> $GITHUB_OUTPUT
 
       # ============================================
-      # 步骤9: 同步 Releases
+      # 步骤9: 同步 Releases（使用 git tag + gh release，无需 PAT）
       # ============================================
       - name: 📦 同步 Releases 与制品
         id: sync_releases
         if: github.event.inputs.skip_release_sync != 'true' && steps.check_releases.outputs.release_count > 0
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          set -e
-
           SYNC_MODE="${{ github.event.inputs.sync_mode_override || env.SYNC_MODE }}"
           CURRENT_REPO="${{ github.repository }}"
           RELEASE_COUNT="${{ steps.check_releases.outputs.release_count }}"
@@ -430,83 +428,62 @@ jobs:
             echo "   制品数量: $ASSET_COUNT"
             echo "=========================================="
 
-            # --- 通过 API 创建/更新 Tag ---
-            TAG_EXISTS=$(curl -s -o /dev/null -w "%{http_code}" \
-              -H "Authorization: token $GITHUB_TOKEN" \
-              "https://api.github.com/repos/$CURRENT_REPO/git/refs/tags/$TAG_NAME")
-
-            if [ "$TAG_EXISTS" == "200" ]; then
-              echo "   ⚠️ Tag 已存在，删除后重建..."
-              curl -X DELETE -s -H "Authorization: token $GITHUB_TOKEN" \
-                "https://api.github.com/repos/$CURRENT_REPO/git/refs/tags/$TAG_NAME" > /dev/null
+            # --- 创建 Tag（用 git 命令，不走 API，避免 403）---
+            if git tag -l "$TAG_NAME" | grep -q .; then
+              echo "   ⚠️ Tag 已存在"
+              if [ "$SYNC_MODE" == "force" ]; then
+                echo "   🔄 强制模式：删除并重建 Tag..."
+                git tag -d "$TAG_NAME"
+                git push origin ":refs/tags/$TAG_NAME" 2>/dev/null || true
+              fi
             fi
 
-            # 创建 Tag 引用（关键：必须检查 HTTP 状态码！）
-            TAG_CREATE_RESP=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X POST \
-              -H "Authorization: token $GITHUB_TOKEN" \
-              -H "Content-Type: application/json" \
-              -d "{
-                \"ref\": \"refs/tags/$TAG_NAME\",
-                \"sha\": \"$TARGET_SHA\"
-              }" \
-              "https://api.github.com/repos/$CURRENT_REPO/git/refs")
-
-            TAG_HTTP=$(echo "$TAG_CREATE_RESP" | grep "HTTP_CODE:" | cut -d: -f2)
-            if [ "$TAG_HTTP" != "201" ]; then
-              echo "   ❌ Tag 创建失败 (HTTP $TAG_HTTP)"
-              echo "   响应: $(echo "$TAG_CREATE_RESP" | grep -v "HTTP_CODE:" | head -c 300)"
-              echo "   可能原因: commit SHA '$TARGET_SHA' 不在当前 fork 中，请先同步代码"
-              continue
+            if ! git tag -l "$TAG_NAME" | grep -q .; then
+              git tag "$TAG_NAME" "$TARGET_SHA"
+              git push origin "$TAG_NAME"
+              echo "   ✅ Tag 创建成功"
             fi
-            echo "   ✅ Tag 创建成功"
 
-            # --- 处理 Release ---
-            RELEASE_EXISTS=$(curl -s -o /dev/null -w "%{http_code}" \
-              -H "Authorization: token $GITHUB_TOKEN" \
-              "https://api.github.com/repos/$CURRENT_REPO/releases/tags/$TAG_NAME")
-
-            if [ "$RELEASE_EXISTS" == "200" ]; then
+            # --- 处理 Release（用 gh release，不走 API，避免 403）---
+            if gh release view "$TAG_NAME" --repo "$CURRENT_REPO" > /dev/null 2>&1; then
               echo "   ⚠️ Release 已存在"
               if [ "$SYNC_MODE" == "force" ]; then
                 echo "   🔄 强制模式：删除并重建 Release..."
-                RELEASE_ID=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
-                  "https://api.github.com/repos/$CURRENT_REPO/releases/tags/$TAG_NAME" | jq -r '.id')
-                curl -X DELETE -s -H "Authorization: token $GITHUB_TOKEN" \
-                  "https://api.github.com/repos/$CURRENT_REPO/releases/$RELEASE_ID"
-                sleep 3
+                gh release delete "$TAG_NAME" --yes --repo "$CURRENT_REPO" --cleanup-tag
+                sleep 2
+                # 重新创建 tag（上面被 --cleanup-tag 删了）
+                git tag "$TAG_NAME" "$TARGET_SHA" 2>/dev/null || true
+                git push origin "$TAG_NAME" 2>/dev/null || true
                 echo "   ✅ Release 已删除"
-                RELEASE_EXISTS="404"
               fi
             fi
 
-            if [ "$RELEASE_EXISTS" != "200" ]; then
+            if ! gh release view "$TAG_NAME" --repo "$CURRENT_REPO" > /dev/null 2>&1; then
               echo "   📌 创建 Release"
-              RELEASE_BODY=$(printf '%s' "$BODY" | jq -R -s '.')
-              [ "$RELEASE_BODY" == "null" ] && RELEASE_BODY='""'
-              RELEASE_NAME_JSON=$(printf '%s' "$RELEASE_NAME" | jq -R -s '.')
-              [ "$RELEASE_NAME_JSON" == "null" ] && RELEASE_NAME_JSON='""'
 
-              # 增加 target_commitish 兜底，即使 tag 有问题也能创建 release
-              CREATE_RESP=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X POST \
-                -H "Authorization: token $GITHUB_TOKEN" \
-                -H "Accept: application/vnd.github+json" \
-                -H "Content-Type: application/json" \
-                -d "{
-                  \"tag_name\": \"$TAG_NAME\",
-                  \"name\": $RELEASE_NAME_JSON,
-                  \"body\": $RELEASE_BODY,
-                  \"prerelease\": $PRERELEASE,
-                  \"target_commitish\": \"$TARGET_SHA\"
-                }" \
-                "https://api.github.com/repos/$CURRENT_REPO/releases")
+              # 把 body 写入临时文件，避免 shell 转义问题
+              BODY_FILE="/tmp/release_body_${TAG_NAME}.md"
+              printf '%s' "$BODY" > "$BODY_FILE"
 
-              HTTP_CODE=$(echo "$CREATE_RESP" | grep "HTTP_CODE:" | cut -d: -f2)
-              if [ "$HTTP_CODE" != "201" ]; then
-                echo "   ❌ Release 创建失败 (HTTP $HTTP_CODE)"
-                echo "   响应: $(echo "$CREATE_RESP" | head -c 500)"
+              PRERELEASE_FLAG=""
+              if [ "$PRERELEASE" == "true" ]; then
+                PRERELEASE_FLAG="--prerelease"
+              fi
+
+              if gh release create "$TAG_NAME" \
+                --repo "$CURRENT_REPO" \
+                --target "$TARGET_SHA" \
+                --title "$RELEASE_NAME" \
+                --notes-file "$BODY_FILE" \
+                $PRERELEASE_FLAG; then
+                echo "   ✅ Release 创建成功"
+              else
+                echo "   ❌ Release 创建失败"
+                rm -f "$BODY_FILE"
                 continue
               fi
-              echo "   ✅ Release 创建成功"
+
+              rm -f "$BODY_FILE"
             fi
 
             # --- 处理制品 ---
@@ -530,13 +507,16 @@ jobs:
 
               echo "     📥 下载: $ASSET_NAME ($ASSET_SIZE bytes)"
 
-              HTTP_CODE=$(curl -L --fail -s -o "$ASSET_NAME" -w "%{http_code}" \
+              curl -L --fail -s -o "$ASSET_NAME" \
                 --connect-timeout 30 --max-time 1800 \
-                -H "Accept: application/octet-stream" \
-                "$ASSET_URL" 2>&1) || HTTP_CODE="FAIL"
+                "$ASSET_URL" || {
+                echo "     ❌ 下载失败: $ASSET_NAME"
+                rm -f "$ASSET_NAME"
+                continue
+              }
 
-              if [ "$HTTP_CODE" != "200" ] || [ ! -s "$ASSET_NAME" ]; then
-                echo "     ❌ 下载失败: $ASSET_NAME (HTTP $HTTP_CODE)"
+              if [ ! -s "$ASSET_NAME" ]; then
+                echo "     ❌ 下载文件为空: $ASSET_NAME"
                 rm -f "$ASSET_NAME"
                 continue
               fi
@@ -545,7 +525,7 @@ jobs:
               echo "     📦 实际大小: ${ACTUAL_SIZE} bytes"
 
               echo "     📤 上传: $ASSET_NAME"
-              if gh release upload "$TAG_NAME" "$ASSET_NAME" --clobber --repo "$CURRENT_REPO" 2>&1; then
+              if gh release upload "$TAG_NAME" "$ASSET_NAME" --clobber --repo "$CURRENT_REPO"; then
                 echo "     ✅ 上传完成"
               else
                 echo "     ❌ 上传失败: $ASSET_NAME"
@@ -570,55 +550,46 @@ jobs:
           steps.check_releases.outputs.release_count > 0 &&
           steps.sync_releases.outputs.sync_success == 'true'
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           echo "=========================================="
           echo "🧹 清理旧 Releases（只保留最新）"
           echo "=========================================="
-          
+
           CURRENT_REPO="${{ github.repository }}"
-          
-          RELEASES=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
-            "https://api.github.com/repos/$CURRENT_REPO/releases?per_page=100")
-          
-          TOTAL_COUNT=$(echo "$RELEASES" | jq '. | length')
-          
+
+          RELEASE_LIST=$(gh release list --repo "$CURRENT_REPO" --limit 100 --json tagName)
+
+          TOTAL_COUNT=$(echo "$RELEASE_LIST" | jq '. | length')
+
           if [ "$TOTAL_COUNT" -le 1 ]; then
             echo "📌 Release 数量: $TOTAL_COUNT，无需清理"
             exit 0
           fi
-          
+
           echo "📊 当前 Release 数量: $TOTAL_COUNT"
-          
-          LATEST_RELEASE_TAG=$(echo "$RELEASES" | jq -r '.[0].tag_name')
-          LATEST_RELEASE_ID=$(echo "$RELEASES" | jq -r '.[0].id')
-          
-          echo "📌 最新 Release: $LATEST_RELEASE_TAG"
+
+          LATEST_TAG=$(echo "$RELEASE_LIST" | jq -r '.[0].tagName')
+
+          echo "📌 最新 Release: $LATEST_TAG"
           echo ""
-          
+
           DELETED_COUNT=0
-          
-          echo "$RELEASES" | jq -c '.[]' | while read release; do
-            TAG_NAME=$(echo $release | jq -r '.tag_name')
-            RELEASE_ID=$(echo $release | jq -r '.id')
-            
-            if [ "$RELEASE_ID" != "$LATEST_RELEASE_ID" ]; then
+
+          echo "$RELEASE_LIST" | jq -c '.[]' | while read -r release; do
+            TAG_NAME=$(echo "$release" | jq -r '.tagName')
+
+            if [ "$TAG_NAME" != "$LATEST_TAG" ]; then
               echo "   🗑️ 删除: $TAG_NAME"
-              
-              curl -X DELETE -s -H "Authorization: token $GITHUB_TOKEN" \
-                "https://api.github.com/repos/$CURRENT_REPO/releases/$RELEASE_ID"
-              
-              curl -X DELETE -s -H "Authorization: token $GITHUB_TOKEN" \
-                "https://api.github.com/repos/$CURRENT_REPO/git/refs/tags/$TAG_NAME" 2>/dev/null || true
-              
+              gh release delete "$TAG_NAME" --yes --repo "$CURRENT_REPO" --cleanup-tag 2>/dev/null || true
               DELETED_COUNT=$((DELETED_COUNT + 1))
             fi
           done
-          
+
           echo ""
           echo "✅ 清理完成"
           echo "   删除: $DELETED_COUNT"
-          echo "   保留: $LATEST_RELEASE_TAG"
+          echo "   保留: $LATEST_TAG"
 
       # ============================================
       # 步骤11: 验证
@@ -626,30 +597,15 @@ jobs:
       - name: ✅ 验证同步结果
         if: github.event.inputs.skip_release_sync != 'true'
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           echo "=========================================="
           echo "✅ 验证同步结果"
           echo "=========================================="
-          
+
           CURRENT_REPO="${{ github.repository }}"
-          
-          RELEASES=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
-            "https://api.github.com/repos/$CURRENT_REPO/releases?per_page=100")
-          
-          RELEASE_COUNT=$(echo "$RELEASES" | jq '. | length')
-          echo "📊 当前 Release 数量: $RELEASE_COUNT"
-          
-          if [ "$RELEASE_COUNT" -gt 0 ]; then
-            echo "📌 Release 列表:"
-            echo "$RELEASES" | jq -r '.[] | "   - \(.tag_name) - 制品数: \(.assets | length)"'
-            
-            echo ""
-            echo "📦 制品详情:"
-            echo "$RELEASES" | jq -r '.[] | "   \(.tag_name): " + (.assets | map(.name) | join(", "))'
-          else
-            echo "⚠️ 没有 Release"
-          fi
+
+          gh release list --repo "$CURRENT_REPO" --limit 10
 
       # ============================================
       # 步骤12: 结果
@@ -681,7 +637,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ github.token }}
 
       - name: ⚙️ 配置 Git
         run: |
