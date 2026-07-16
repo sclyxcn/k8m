@@ -64,13 +64,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     
-    # 授予所有权限
+    # 授予所有权限（metadata 是无效值，已移除）
     permissions:
       contents: write
       actions: write
       issues: write
       pull-requests: write
-      metadata: read
     
     concurrency:
       group: sync-upstream
@@ -103,7 +102,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          # 优先使用 PAT_TOKEN，如果没有则使用 GITHUB_TOKEN
           token: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
 
       # ============================================
@@ -113,7 +111,6 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          # 配置 Git 使用 token 认证
           git config --global http.https://github.com/.extraheader "Authorization: Bearer ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}"
 
       # ============================================
@@ -131,7 +128,7 @@ jobs:
           echo "✅ 上游仓库添加成功"
 
       # ============================================
-      # 步骤5: 【新增】检查权限
+      # 步骤5: 检查推送权限
       # ============================================
       - name: 🔑 检查推送权限
         run: |
@@ -139,7 +136,6 @@ jobs:
           echo "🔑 检查推送权限"
           echo "=========================================="
           
-          # 尝试推送一个测试
           if git push origin --dry-run 2>&1 | grep -q "403"; then
             echo "❌ 推送权限不足！"
             echo "请执行以下操作之一："
@@ -160,13 +156,11 @@ jobs:
           echo "🚫 禁用上游仓库的 Actions"
           echo "=========================================="
           
-          # 获取当前工作流文件名
           CURRENT_WORKFLOW="sync-upstream.yml"
           
           if [ -d ".github/workflows" ]; then
             echo "发现 .github/workflows 目录"
             
-            # 删除其他 workflow 文件，保留当前文件
             find .github/workflows -name "*.yml" -o -name "*.yaml" | while read file; do
               filename=$(basename "$file")
               if [ "$filename" != "$CURRENT_WORKFLOW" ] && [ "$filename" != "sync-upstream.yml" ]; then
@@ -177,7 +171,6 @@ jobs:
               fi
             done
             
-            # 检查是否有更改
             if git status --porcelain | grep -q ".github/workflows"; then
               git add .github/workflows/
               git commit -m "[skip ci] 禁用上游 Actions，仅保留同步工作流"
@@ -248,11 +241,17 @@ jobs:
           RELEASE_COUNT=$(echo "$RELEASES" | jq '. | length')
           echo "📊 上游 Release 数量: $RELEASE_COUNT"
           
+          if [ "$RELEASE_COUNT" -eq 0 ]; then
+            echo "⚠️ 上游仓库没有 Release"
+          else
+            echo "$RELEASES" | jq -r '.[] | "   - \(.tag_name)"'
+          fi
+          
           echo "$RELEASES" > /tmp/upstream_releases.json
           echo "release_count=$RELEASE_COUNT" >> $GITHUB_OUTPUT
 
       # ============================================
-      # 步骤9: 同步 Releases
+      # 步骤9: 同步 Releases 与制品
       # ============================================
       - name: 📦 同步 Releases 与制品
         if: github.event.inputs.skip_release_sync != 'true'
@@ -290,8 +289,11 @@ jobs:
             TARGET_SHA=$(echo $release | jq -r '.target_commitish')
             
             echo ""
+            echo "=========================================="
             echo "📌 处理 Release: $TAG_NAME"
+            echo "=========================================="
             
+            # --- 处理 Tag ---
             if echo "$LOCAL_TAGS" | grep -q "^$TAG_NAME$"; then
               echo "   ✅ Tag 已存在"
             else
@@ -305,13 +307,24 @@ jobs:
               echo "   ✅ Tag 已创建"
             fi
             
-            # 创建 Release
+            # --- 处理 Release ---
             RELEASE_EXISTS=$(curl -s -o /dev/null -w "%{http_code}" \
               -H "Authorization: token $GITHUB_TOKEN" \
               "https://api.github.com/repos/$CURRENT_REPO/releases/tags/$TAG_NAME")
             
             if [ "$RELEASE_EXISTS" == "200" ]; then
               echo "   ✅ Release 已存在"
+              if [ "$SYNC_MODE" == "force" ]; then
+                echo "   强制模式：清理现有制品..."
+                LOCAL_RELEASE_ID=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+                  "https://api.github.com/repos/$CURRENT_REPO/releases/tags/$TAG_NAME" | jq -r '.id')
+                ASSETS=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+                  "https://api.github.com/repos/$CURRENT_REPO/releases/$LOCAL_RELEASE_ID/assets" | jq -r '.[].id')
+                for ASSET_ID in $ASSETS; do
+                  curl -X DELETE -s -H "Authorization: token $GITHUB_TOKEN" \
+                    "https://api.github.com/repos/$CURRENT_REPO/releases/assets/$ASSET_ID"
+                done
+              fi
             else
               echo "   📌 创建 Release"
               RELEASE_BODY=$(echo "$BODY" | jq -R -s '.')
@@ -319,7 +332,7 @@ jobs:
               RELEASE_NAME_JSON=$(echo "$RELEASE_NAME" | jq -R -s '.')
               [ "$RELEASE_NAME_JSON" == "null" ] && RELEASE_NAME_JSON='""'
               
-              curl -s -X POST \
+              RESPONSE=$(curl -s -X POST -w "\n%{http_code}" \
                 -H "Authorization: token $GITHUB_TOKEN" \
                 -H "Content-Type: application/json" \
                 -d "{
@@ -328,26 +341,46 @@ jobs:
                   \"body\": $RELEASE_BODY,
                   \"prerelease\": $PRERELEASE
                 }" \
-                "https://api.github.com/repos/$CURRENT_REPO/releases" > /dev/null
-              echo "   ✅ Release 创建成功"
+                "https://api.github.com/repos/$CURRENT_REPO/releases")
+              
+              HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+              if [ "$HTTP_CODE" == "201" ]; then
+                echo "   ✅ Release 创建成功"
+              else
+                echo "   ❌ Release 创建失败 (HTTP $HTTP_CODE)"
+                exit 1
+              fi
             fi
             
-            # 处理制品
-            echo "$RELEASE_EXISTS" | jq -c '.assets[]' 2>/dev/null | while read asset; do
+            # --- 处理制品 ---
+            ASSETS=$(echo $release | jq -c '.assets[]')
+            [ -z "$ASSETS" ] || [ "$ASSETS" == "null" ] && continue
+            
+            echo "   📦 处理制品..."
+            echo "$ASSETS" | while read asset; do
               ASSET_NAME=$(echo $asset | jq -r '.name')
               ASSET_URL=$(echo $asset | jq -r '.browser_download_url')
+              
               [ -z "$ASSET_NAME" ] || [ "$ASSET_NAME" == "null" ] && continue
+              
+              # 增量模式检查
+              if [ "$SYNC_MODE" == "incremental" ] && [ "$RELEASE_EXISTS" == "200" ]; then
+                EXISTING=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+                  "https://api.github.com/repos/$CURRENT_REPO/releases/tags/$TAG_NAME" | jq -r ".assets[] | select(.name==\"$ASSET_NAME\") | .name")
+                [ "$EXISTING" == "$ASSET_NAME" ] && echo "     ✅ 跳过: $ASSET_NAME" && continue
+              fi
               
               echo "     📥 下载: $ASSET_NAME"
               wget -q --tries=3 --timeout=300 "$ASSET_URL" -O "$ASSET_NAME" || continue
               
               echo "     📤 上传: $ASSET_NAME"
-              gh release upload "$TAG_NAME" "$ASSET_NAME" --clobber --repo "$CURRENT_REPO" || true
+              gh release upload "$TAG_NAME" "$ASSET_NAME" --clobber --repo "$CURRENT_REPO"
               
               rm -f "$ASSET_NAME"
             done
           done
           
+          echo ""
           echo "✅ 所有 Release 同步完成"
 
       # ============================================
@@ -370,6 +403,7 @@ jobs:
           
           CURRENT_TIME=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
           echo "当前时间: $CURRENT_TIME"
+          echo "下次定时执行: $(date -u -d '5 days' '+%Y-%m-%d %H:%M:%S UTC')"
           
           LAST_COMMIT_MSG=$(git log -1 --pretty=%B)
           
@@ -383,6 +417,7 @@ jobs:
           fi
           
           echo "✅ 仓库保活完成"
+          echo "📌 仓库活动时间已更新，60天计时器已重置"
 
       # ============================================
       # 步骤12: 验证
@@ -403,6 +438,10 @@ jobs:
           
           RELEASE_COUNT=$(echo "$RELEASES" | jq '. | length')
           echo "📊 当前仓库 Release 数量: $RELEASE_COUNT"
+          
+          if [ "$RELEASE_COUNT" -gt 0 ]; then
+            echo "$RELEASES" | jq -r '.[] | "   - \(.tag_name) - 制品数: \(.assets | length)"'
+          fi
 
       # ============================================
       # 步骤13: 结果
@@ -412,6 +451,7 @@ jobs:
         run: |
           if [ "${{ job.status }}" == "success" ]; then
             echo "🎉 同步任务执行成功！"
+            echo "📌 下次自动执行: $(date -u -d '5 days' '+%Y-%m-%d %H:%M:%S UTC')"
           else
             echo "❌ 同步任务执行失败，请检查上方日志"
             exit 1
