@@ -249,6 +249,7 @@ jobs:
       # 步骤6.5: 同步上游代码到 fork（保留本地 workflows）
       # ============================================
       - name: 🔄 同步上游代码
+        id: code_sync
         if: github.event.inputs.skip_code_sync != 'true'
         env:
           TARGET_SHA: ${{ steps.get_sha.outputs.commit_sha }}
@@ -301,6 +302,11 @@ jobs:
             git push origin "$CURRENT_BRANCH" --force-with-lease || git push origin "$CURRENT_BRANCH" --force
             echo "✅ 代码同步完成（本地 workflows 已保留）"
           fi
+
+          # 输出实际 tag 应指向的 SHA（当前 HEAD，包含本地 workflows）
+          ACTUAL_SHA=$(git rev-parse HEAD)
+          echo "📌 实际 HEAD SHA: $ACTUAL_SHA"
+          echo "tag_target_sha=$ACTUAL_SHA" >> $GITHUB_OUTPUT
 
       # ============================================
       # 步骤7: 禁用上游 Actions
@@ -416,14 +422,15 @@ jobs:
           SYNC_MODE="${{ github.event.inputs.sync_mode_override || env.SYNC_MODE }}"
           CURRENT_REPO="${{ github.repository }}"
           RELEASE_COUNT="${{ steps.check_releases.outputs.release_count }}"
-          TARGET_SHA="${{ steps.get_sha.outputs.commit_sha }}"
+          # 使用当前 HEAD（已恢复本地 workflows），而非上游 commit SHA
+          TARGET_SHA="${{ steps.code_sync.outputs.tag_target_sha || steps.get_sha.outputs.commit_sha }}"
 
           echo "=========================================="
           echo "📦 同步 Releases"
           echo "=========================================="
           echo "同步模式: $SYNC_MODE"
           echo "Release 数量: $RELEASE_COUNT"
-          echo "目标 commit SHA: $TARGET_SHA"
+          echo "Tag 目标 SHA（本地 HEAD）: $TARGET_SHA"
           echo "=========================================="
 
           if [ -z "$TARGET_SHA" ]; then
