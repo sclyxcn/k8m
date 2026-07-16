@@ -732,21 +732,31 @@ jobs:
           echo "=========================================="
           echo "💚 仓库保活"
           echo "=========================================="
-          
+
           CURRENT_TIME=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
           echo "当前时间: $CURRENT_TIME"
-          
+
+          # 获取最近一次 commit 的时间戳和 message
+          LAST_COMMIT_TIME=$(git log -1 --format=%ct)
           LAST_COMMIT_MSG=$(git log -1 --pretty=%B)
-          
-          if [[ "$LAST_COMMIT_MSG" == *"[skip ci] keepalive"* ]]; then
-            echo "最近提交已是保活提交，跳过"
+          NOW_TIME=$(date +%s)
+
+          # 计算距今天数
+          DAYS_SINCE=$(( (NOW_TIME - LAST_COMMIT_TIME) / 86400 ))
+          echo "最近提交时间: $(date -u -d @$LAST_COMMIT_TIME '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "距今: ${DAYS_SINCE} 天"
+          echo "最近提交: ${LAST_COMMIT_MSG}"
+
+          # 超过 30 天必须保活；30 天内如果是非 keepalive 提交则跳过
+          if [ "$DAYS_SINCE" -lt 30 ] && [[ "$LAST_COMMIT_MSG" == *"[skip ci] keepalive"* ]]; then
+            echo "✅ 最近 ${DAYS_SINCE} 天内有保活提交，跳过"
           else
-            echo "创建保活空提交..."
+            echo "⚠️ 距上次提交已 ${DAYS_SINCE} 天，创建保活提交..."
             git commit --allow-empty -m "[skip ci] keepalive: 仓库保活 $(date -u '+%Y-%m-%d')"
-            git push origin $(git branch --show-current)
+            git push origin "$(git branch --show-current)"
             echo "✅ 保活提交已推送"
           fi
-          
+
           echo "✅ 保活完成"
 
       - name: 📢 保活结果
