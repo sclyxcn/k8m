@@ -81,7 +81,7 @@ jobs:
       # 步骤1: 检出复刻仓库
       # ============================================
       - name: 📥 检出复刻仓库
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
           token: ${{ github.token }}
@@ -288,12 +288,12 @@ jobs:
               echo "📁 恢复本地 workflows..."
               rm -rf .github/workflows
               cp -r /tmp/local_workflows_backup .github/workflows
-              # 如果有变化就提交
+              # 如果有变化就提交（-A 确保 stage 删除操作）
               if git diff --quiet -- .github/workflows; then
                 echo "   workflows 无变化"
               else
-                git add .github/workflows
-                git commit -m "[skip ci] 保留本地 workflows"
+                git add -A .github/workflows
+                git commit -m "[skip ci] 保留本地 workflows，删除上游 workflows"
                 echo "   ✅ 本地 workflows 已恢复并提交"
               fi
             fi
@@ -309,40 +309,98 @@ jobs:
           echo "tag_target_sha=$ACTUAL_SHA" >> $GITHUB_OUTPUT
 
       # ============================================
-      # 步骤7: 禁用上游 Actions
+      # 步骤7: 删除上游 Actions（只保留本地 workflow）
       # ============================================
-      - name: 🚫 禁用上游 Actions
+      - name: 🚫 删除上游 Actions
         if: github.event.inputs.disable_upstream_actions == 'true'
         continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           echo "=========================================="
-          echo "🚫 禁用上游 Actions"
+          echo "🚫 删除上游 Actions（只保留本地 workflow）"
           echo "=========================================="
-          
-          if [ ! -d ".github/workflows" ]; then
+
+          # 本地受保护的 workflow 文件名列表
+          PROTECTED_FILES="sync-upstream.yml sync-upstream.yaml"
+
+          # 1. 删除 .github/workflows 下非本地的 yml/yaml 文件
+          if [ -d ".github/workflows" ]; then
+            DELETED=0
+            find .github/workflows -maxdepth 1 \( -name "*.yml" -o -name "*.yaml" -o -name "*.disabled" \) | while read -r file; do
+              filename=$(basename "$file")
+              IS_PROTECTED=false
+              for p in $PROTECTED_FILES; do
+                if [ "$filename" == "$p" ]; then
+                  IS_PROTECTED=true
+                  break
+                fi
+              done
+              if [ "$IS_PROTECTED" == "true" ]; then
+                echo "   🔒 保护: $file"
+              else
+                echo "   🗑️ 删除: $file"
+                rm -f "$file"
+              fi
+            done
+
+            if git status --porcelain | grep -q ".github/workflows"; then
+              git add -A .github/workflows/
+              git commit -m "[skip ci] 删除上游 Actions，只保留本地 workflow"
+              git push origin "$(git branch --show-current)"
+              echo "✅ 上游 Actions 已删除并提交"
+            else
+              echo "✅ 没有需要删除的上游 Actions"
+            fi
+          else
             echo "⚠️ .github/workflows 目录不存在"
+          fi
+
+          # 2. 清理 Actions 历史运行记录（非 sync-upstream 的）
+          echo ""
+          echo "🧹 清理 Actions 历史运行记录..."
+          CURRENT_REPO="${{ github.repository }}"
+
+          # 获取所有 workflow 列表
+          WORKFLOWS=$(gh api "/repos/$CURRENT_REPO/actions/workflows" --paginate 2>/dev/null | jq -c '.workflows[]' 2>/dev/null) || {
+            echo "⚠️ 无法获取 workflow 列表，跳过清理"
+            exit 0
+          }
+
+          if [ -z "$WORKFLOWS" ]; then
+            echo "   没有需要清理的 workflow"
             exit 0
           fi
-          
-          find .github/workflows -maxdepth 1 -name "*.yml" -o -name "*.yaml" | while read file; do
-            filename=$(basename "$file")
-            if [ "$filename" == "sync-upstream.yml" ] || [ "$filename" == "sync-upstream.yaml" ]; then
-              echo "   🔒 保护: $file"
+
+          echo "$WORKFLOWS" | while read -r wf; do
+            WF_ID=$(echo "$wf" | jq -r '.id')
+            WF_NAME=$(echo "$wf" | jq -r '.name')
+            WF_PATH=$(echo "$wf" | jq -r '.path')
+            WF_STATE=$(echo "$wf" | jq -r '.state')
+
+            # 保留 sync-upstream workflow
+            if echo "$WF_PATH" | grep -q "sync-upstream"; then
+              echo "   🔒 保护: $WF_NAME (ID: $WF_ID)"
               continue
             fi
-            new_file="${file}.disabled"
-            echo "   🚫 禁用: $file → $new_file"
-            mv "$file" "$new_file"
+
+            echo "   🗑️ 清理 workflow: $WF_NAME (ID: $WF_ID, Path: $WF_PATH)"
+
+            # 删除该 workflow 的所有历史运行记录
+            RUNS=$(gh api "/repos/$CURRENT_REPO/actions/workflows/$WF_ID/runs?per_page=100" --paginate 2>/dev/null | jq -c '.workflow_runs[]' 2>/dev/null) || true
+
+            if [ -n "$RUNS" ]; then
+              echo "$RUNS" | while read -r run; do
+                RUN_ID=$(echo "$run" | jq -r '.id')
+                gh api -X DELETE "/repos/$CURRENT_REPO/actions/runs/$RUN_ID" 2>/dev/null || true
+              done
+              echo "      ✅ 运行记录已删除"
+            fi
+
+            # 删除 workflow 本身（从 Actions 页面移除）
+            gh api -X DELETE "/repos/$CURRENT_REPO/actions/workflows/$WF_ID" 2>/dev/null || true
+            echo "      ✅ workflow 已从 Actions 页面移除"
           done
-          
-          if git status --porcelain | grep -q ".github/workflows"; then
-            git add .github/workflows/
-            git commit -m "[skip ci] 禁用上游 Actions"
-            git push origin $(git branch --show-current)
-            echo "✅ 更改已提交"
-          else
-            echo "✅ 没有需要禁用的 Actions"
-          fi
 
       # ============================================
       # 步骤8: 检查上游 Release
@@ -659,7 +717,7 @@ jobs:
     
     steps:
       - name: 📥 检出仓库
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
           token: ${{ github.token }}
