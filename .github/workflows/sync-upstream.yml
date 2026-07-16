@@ -305,12 +305,12 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
-          
+
           SYNC_MODE="${{ github.event.inputs.sync_mode_override || env.SYNC_MODE }}"
           CURRENT_REPO="${{ github.repository }}"
           RELEASE_COUNT="${{ steps.check_releases.outputs.release_count }}"
           TARGET_SHA="${{ steps.get_sha.outputs.commit_sha }}"
-          
+
           echo "=========================================="
           echo "📦 同步 Releases"
           echo "=========================================="
@@ -318,43 +318,38 @@ jobs:
           echo "Release 数量: $RELEASE_COUNT"
           echo "目标 commit SHA: $TARGET_SHA"
           echo "=========================================="
-          
+
           if [ -z "$TARGET_SHA" ]; then
             echo "❌ 错误: 无法获取目标 commit SHA"
             exit 1
           fi
-          
+
           RELEASES=$(cat /tmp/upstream_releases.json)
-          
-          echo "$RELEASES" | jq -c '.[]' | while read release; do
-            TAG_NAME=$(echo $release | jq -r '.tag_name')
-            RELEASE_NAME=$(echo $release | jq -r '.name')
-            BODY=$(echo $release | jq -r '.body')
-            PRERELEASE=$(echo $release | jq -r '.prerelease')
-            PUBLISHED_AT=$(echo $release | jq -r '.published_at')
-            ASSET_COUNT=$(echo $release | jq '.assets | length')
-            
+
+          echo "$RELEASES" | jq -c '.[]' | while read -r release; do
+            TAG_NAME=$(echo "$release" | jq -r '.tag_name')
+            RELEASE_NAME=$(echo "$release" | jq -r '.name')
+            BODY=$(echo "$release" | jq -r '.body')
+            PRERELEASE=$(echo "$release" | jq -r '.prerelease')
+            ASSET_COUNT=$(echo "$release" | jq '.assets | length')
+
             echo ""
             echo "=========================================="
             echo "📌 Release: $TAG_NAME"
-            echo "   发布时间: $PUBLISHED_AT"
             echo "   制品数量: $ASSET_COUNT"
             echo "=========================================="
-            
+
             # --- 通过 API 创建/更新 Tag ---
-            echo "   📌 通过 API 创建/更新 Tag..."
-            
-            # 先删除旧 Tag（如果存在）
             TAG_EXISTS=$(curl -s -o /dev/null -w "%{http_code}" \
               -H "Authorization: token $GITHUB_TOKEN" \
               "https://api.github.com/repos/$CURRENT_REPO/git/refs/tags/$TAG_NAME")
-            
+
             if [ "$TAG_EXISTS" == "200" ]; then
               echo "   ⚠️ Tag 已存在，删除后重建..."
               curl -X DELETE -s -H "Authorization: token $GITHUB_TOKEN" \
                 "https://api.github.com/repos/$CURRENT_REPO/git/refs/tags/$TAG_NAME" > /dev/null
             fi
-            
+
             # 创建 Tag 引用
             curl -s -X POST \
               -H "Authorization: token $GITHUB_TOKEN" \
@@ -365,12 +360,12 @@ jobs:
               }" \
               "https://api.github.com/repos/$CURRENT_REPO/git/refs" > /dev/null
             echo "   ✅ Tag 创建成功"
-            
+
             # --- 处理 Release ---
             RELEASE_EXISTS=$(curl -s -o /dev/null -w "%{http_code}" \
               -H "Authorization: token $GITHUB_TOKEN" \
               "https://api.github.com/repos/$CURRENT_REPO/releases/tags/$TAG_NAME")
-            
+
             if [ "$RELEASE_EXISTS" == "200" ]; then
               echo "   ⚠️ Release 已存在"
               if [ "$SYNC_MODE" == "force" ]; then
@@ -379,20 +374,22 @@ jobs:
                   "https://api.github.com/repos/$CURRENT_REPO/releases/tags/$TAG_NAME" | jq -r '.id')
                 curl -X DELETE -s -H "Authorization: token $GITHUB_TOKEN" \
                   "https://api.github.com/repos/$CURRENT_REPO/releases/$RELEASE_ID"
+                sleep 3
                 echo "   ✅ Release 已删除"
                 RELEASE_EXISTS="404"
               fi
             fi
-            
+
             if [ "$RELEASE_EXISTS" != "200" ]; then
               echo "   📌 创建 Release"
-              RELEASE_BODY=$(echo "$BODY" | jq -R -s '.')
+              RELEASE_BODY=$(printf '%s' "$BODY" | jq -R -s '.')
               [ "$RELEASE_BODY" == "null" ] && RELEASE_BODY='""'
-              RELEASE_NAME_JSON=$(echo "$RELEASE_NAME" | jq -R -s '.')
+              RELEASE_NAME_JSON=$(printf '%s' "$RELEASE_NAME" | jq -R -s '.')
               [ "$RELEASE_NAME_JSON" == "null" ] && RELEASE_NAME_JSON='""'
-              
-              curl -s -X POST \
+
+              CREATE_RESP=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X POST \
                 -H "Authorization: token $GITHUB_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
                 -H "Content-Type: application/json" \
                 -d "{
                   \"tag_name\": \"$TAG_NAME\",
@@ -400,46 +397,63 @@ jobs:
                   \"body\": $RELEASE_BODY,
                   \"prerelease\": $PRERELEASE
                 }" \
-                "https://api.github.com/repos/$CURRENT_REPO/releases" > /dev/null
+                "https://api.github.com/repos/$CURRENT_REPO/releases")
+
+              HTTP_CODE=$(echo "$CREATE_RESP" | grep "HTTP_CODE:" | cut -d: -f2)
+              if [ "$HTTP_CODE" != "201" ]; then
+                echo "   ❌ Release 创建失败 (HTTP $HTTP_CODE)"
+                echo "   响应: $(echo "$CREATE_RESP" | head -c 500)"
+                continue
+              fi
               echo "   ✅ Release 创建成功"
             fi
-            
+
             # --- 处理制品 ---
-            ASSETS=$(echo $release | jq -c '.assets[]')
-            if [ -z "$ASSETS" ] || [ "$ASSETS" == "null" ]; then
+            if [ "$ASSET_COUNT" -eq 0 ] || [ "$ASSET_COUNT" == "null" ]; then
               echo "   ⚠️ 没有制品文件"
               continue
             fi
-            
-            echo "   📦 处理制品..."
-            echo "$ASSETS" | while read asset; do
-              ASSET_NAME=$(echo $asset | jq -r '.name')
-              ASSET_URL=$(echo $asset | jq -r '.browser_download_url')
-              ASSET_SIZE=$(echo $asset | jq -r '.size')
-              ASSET_SIZE_HR=$(numfmt --to=iec $ASSET_SIZE 2>/dev/null || echo "$ASSET_SIZE bytes")
-              
+
+            echo "   📦 处理 $ASSET_COUNT 个制品..."
+            echo "$release" | jq -c '.assets[]' | while read -r asset; do
+              ASSET_NAME=$(echo "$asset" | jq -r '.name')
+              ASSET_URL=$(echo "$asset" | jq -r '.browser_download_url')
+              ASSET_SIZE=$(echo "$asset" | jq -r '.size')
+
               [ -z "$ASSET_NAME" ] || [ "$ASSET_NAME" == "null" ] && continue
-              
-              # 跳过源码包
+
               if [[ "$ASSET_NAME" == *"Source code"* ]] || [[ "$ASSET_NAME" == *"源码"* ]]; then
                 echo "     ⏭️ 跳过源码包: $ASSET_NAME"
                 continue
               fi
-              
-              echo "     📥 下载: $ASSET_NAME ($ASSET_SIZE_HR)"
-              wget -q --tries=3 --timeout=300 "$ASSET_URL" -O "$ASSET_NAME" || {
-                echo "     ❌ 下载失败"
+
+              echo "     📥 下载: $ASSET_NAME ($ASSET_SIZE bytes)"
+
+              HTTP_CODE=$(curl -L --fail -s -o "$ASSET_NAME" -w "%{http_code}" \
+                --connect-timeout 30 --max-time 1800 \
+                -H "Accept: application/octet-stream" \
+                "$ASSET_URL" 2>&1) || HTTP_CODE="FAIL"
+
+              if [ "$HTTP_CODE" != "200" ] || [ ! -s "$ASSET_NAME" ]; then
+                echo "     ❌ 下载失败: $ASSET_NAME (HTTP $HTTP_CODE)"
+                rm -f "$ASSET_NAME"
                 continue
-              }
-              
+              fi
+
+              ACTUAL_SIZE=$(stat -c%s "$ASSET_NAME" 2>/dev/null || echo 0)
+              echo "     📦 实际大小: ${ACTUAL_SIZE} bytes"
+
               echo "     📤 上传: $ASSET_NAME"
-              gh release upload "$TAG_NAME" "$ASSET_NAME" --clobber --repo "$CURRENT_REPO" || true
-              
+              if gh release upload "$TAG_NAME" "$ASSET_NAME" --clobber --repo "$CURRENT_REPO" 2>&1; then
+                echo "     ✅ 上传完成"
+              else
+                echo "     ❌ 上传失败: $ASSET_NAME"
+              fi
+
               rm -f "$ASSET_NAME"
-              echo "     ✅ 上传完成"
             done
           done
-          
+
           echo ""
           echo "✅ 所有 Release 同步完成"
           echo "sync_success=true" >> $GITHUB_OUTPUT
