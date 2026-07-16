@@ -69,6 +69,8 @@ jobs:
     permissions:
       contents: write
       actions: write
+      pull-requests: write
+      issues: write
     
     concurrency:
       group: sync-upstream
@@ -153,37 +155,70 @@ jobs:
           fi
 
       # ============================================
-      # 步骤4: 配置 Git（不设置 extraheader，避免冲突）
+      # 步骤4: 配置 Git（不设置 extraheader）
       # ============================================
       - name: ⚙️ 配置 Git
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          # 重要：不设置 http.extraheader，避免与 Actions 内置认证冲突
           echo "✅ Git 配置完成"
 
       # ============================================
-      # 步骤5: 添加上游仓库（使用 URL 内嵌 token）
+      # 步骤5: 添加上游仓库
       # ============================================
       - name: 🔗 添加上游仓库
         run: |
           UPSTREAM_REPO="${{ steps.detect_upstream.outputs.upstream_repo }}"
-          # 使用 GITHUB_TOKEN 内嵌在 URL 中
           UPSTREAM_URL="https://${{ secrets.GITHUB_TOKEN }}@github.com/${UPSTREAM_REPO}.git"
           
           echo "上游仓库: $UPSTREAM_REPO"
           git remote add upstream $UPSTREAM_URL || git remote set-url upstream $UPSTREAM_URL
           
-          # 只 fetch tags，不 fetch 代码
+          # 获取上游所有信息（包括分支）
           git fetch upstream --tags --prune --force
+          git fetch upstream --prune
           
           echo "✅ 上游仓库添加成功"
+          echo ""
+          echo "📌 上游分支:"
+          git branch -r | grep upstream | head -3
           echo ""
           echo "📌 上游 Tags:"
           git ls-remote --tags upstream | grep -v '\^{}' | tail -5
 
       # ============================================
-      # 步骤6: 禁用上游 Actions
+      # 步骤6: 获取上游默认分支的 commit SHA
+      # ============================================
+      - name: 🔍 获取上游 commit SHA
+        id: get_sha
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          UPSTREAM_REPO="${{ steps.detect_upstream.outputs.upstream_repo }}"
+          
+          echo "=========================================="
+          echo "🔍 获取上游 commit SHA"
+          echo "=========================================="
+          
+          # 通过 API 获取上游仓库的默认分支
+          REPO_INFO=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+            "https://api.github.com/repos/$UPSTREAM_REPO")
+          
+          DEFAULT_BRANCH=$(echo "$REPO_INFO" | jq -r '.default_branch')
+          echo "默认分支: $DEFAULT_BRANCH"
+          
+          # 获取默认分支的最新 commit SHA
+          BRANCH_INFO=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+            "https://api.github.com/repos/$UPSTREAM_REPO/branches/$DEFAULT_BRANCH")
+          
+          COMMIT_SHA=$(echo "$BRANCH_INFO" | jq -r '.commit.sha')
+          echo "最新 commit SHA: $COMMIT_SHA"
+          
+          echo "default_branch=$DEFAULT_BRANCH" >> $GITHUB_OUTPUT
+          echo "commit_sha=$COMMIT_SHA" >> $GITHUB_OUTPUT
+
+      # ============================================
+      # 步骤7: 禁用上游 Actions
       # ============================================
       - name: 🚫 禁用上游 Actions
         if: github.event.inputs.disable_upstream_actions == 'true'
@@ -219,7 +254,7 @@ jobs:
           fi
 
       # ============================================
-      # 步骤7: 检查上游 Release
+      # 步骤8: 检查上游 Release
       # ============================================
       - name: 🔍 检查上游 Release
         id: check_releases
@@ -261,7 +296,7 @@ jobs:
           echo "release_count=$RELEASE_COUNT" >> $GITHUB_OUTPUT
 
       # ============================================
-      # 步骤8: 同步 Releases
+      # 步骤9: 同步 Releases
       # ============================================
       - name: 📦 同步 Releases 与制品
         id: sync_releases
@@ -274,13 +309,20 @@ jobs:
           SYNC_MODE="${{ github.event.inputs.sync_mode_override || env.SYNC_MODE }}"
           CURRENT_REPO="${{ github.repository }}"
           RELEASE_COUNT="${{ steps.check_releases.outputs.release_count }}"
+          TARGET_SHA="${{ steps.get_sha.outputs.commit_sha }}"
           
           echo "=========================================="
           echo "📦 同步 Releases"
           echo "=========================================="
           echo "同步模式: $SYNC_MODE"
           echo "Release 数量: $RELEASE_COUNT"
+          echo "目标 commit SHA: $TARGET_SHA"
           echo "=========================================="
+          
+          if [ -z "$TARGET_SHA" ]; then
+            echo "❌ 错误: 无法获取目标 commit SHA"
+            exit 1
+          fi
           
           RELEASES=$(cat /tmp/upstream_releases.json)
           
@@ -299,42 +341,30 @@ jobs:
             echo "   制品数量: $ASSET_COUNT"
             echo "=========================================="
             
-            # --- 获取上游 Tag 的 commit SHA ---
-            # 获取上游仓库的默认分支最新 commit
-            DEFAULT_BRANCH=$(git remote show upstream | grep 'HEAD branch' | cut -d' ' -f5)
-            TARGET_SHA=$(git rev-parse upstream/$DEFAULT_BRANCH)
-            echo "   📌 目标 commit: $TARGET_SHA"
-            
             # --- 通过 API 创建/更新 Tag ---
             echo "   📌 通过 API 创建/更新 Tag..."
             
+            # 先删除旧 Tag（如果存在）
             TAG_EXISTS=$(curl -s -o /dev/null -w "%{http_code}" \
               -H "Authorization: token $GITHUB_TOKEN" \
               "https://api.github.com/repos/$CURRENT_REPO/git/refs/tags/$TAG_NAME")
             
             if [ "$TAG_EXISTS" == "200" ]; then
-              # 更新 Tag 引用
-              curl -s -X PATCH \
-                -H "Authorization: token $GITHUB_TOKEN" \
-                -H "Content-Type: application/json" \
-                -d "{
-                  \"sha\": \"$TARGET_SHA\",
-                  \"force\": true
-                }" \
+              echo "   ⚠️ Tag 已存在，删除后重建..."
+              curl -X DELETE -s -H "Authorization: token $GITHUB_TOKEN" \
                 "https://api.github.com/repos/$CURRENT_REPO/git/refs/tags/$TAG_NAME" > /dev/null
-              echo "   ✅ Tag 已更新"
-            else
-              # 创建 Tag 引用
-              curl -s -X POST \
-                -H "Authorization: token $GITHUB_TOKEN" \
-                -H "Content-Type: application/json" \
-                -d "{
-                  \"ref\": \"refs/tags/$TAG_NAME\",
-                  \"sha\": \"$TARGET_SHA\"
-                }" \
-                "https://api.github.com/repos/$CURRENT_REPO/git/refs" > /dev/null
-              echo "   ✅ Tag 已创建"
             fi
+            
+            # 创建 Tag 引用
+            curl -s -X POST \
+              -H "Authorization: token $GITHUB_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"ref\": \"refs/tags/$TAG_NAME\",
+                \"sha\": \"$TARGET_SHA\"
+              }" \
+              "https://api.github.com/repos/$CURRENT_REPO/git/refs" > /dev/null
+            echo "   ✅ Tag 创建成功"
             
             # --- 处理 Release ---
             RELEASE_EXISTS=$(curl -s -o /dev/null -w "%{http_code}" \
@@ -415,7 +445,7 @@ jobs:
           echo "sync_success=true" >> $GITHUB_OUTPUT
 
       # ============================================
-      # 步骤9: 清理旧 Tags 和 Releases（只保留最新）
+      # 步骤10: 清理旧 Releases（只保留最新）
       # ============================================
       - name: 🧹 清理旧 Releases（只保留最新）
         id: cleanup
@@ -433,7 +463,6 @@ jobs:
           
           CURRENT_REPO="${{ github.repository }}"
           
-          # 获取当前仓库的所有 Release
           RELEASES=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
             "https://api.github.com/repos/$CURRENT_REPO/releases?per_page=100")
           
@@ -446,7 +475,6 @@ jobs:
           
           echo "📊 当前 Release 数量: $TOTAL_COUNT"
           
-          # 获取最新的 Release
           LATEST_RELEASE_TAG=$(echo "$RELEASES" | jq -r '.[0].tag_name')
           LATEST_RELEASE_ID=$(echo "$RELEASES" | jq -r '.[0].id')
           
@@ -462,11 +490,9 @@ jobs:
             if [ "$RELEASE_ID" != "$LATEST_RELEASE_ID" ]; then
               echo "   🗑️ 删除: $TAG_NAME"
               
-              # 删除 Release
               curl -X DELETE -s -H "Authorization: token $GITHUB_TOKEN" \
                 "https://api.github.com/repos/$CURRENT_REPO/releases/$RELEASE_ID"
               
-              # 删除对应的 Tag 引用
               curl -X DELETE -s -H "Authorization: token $GITHUB_TOKEN" \
                 "https://api.github.com/repos/$CURRENT_REPO/git/refs/tags/$TAG_NAME" 2>/dev/null || true
               
@@ -476,11 +502,11 @@ jobs:
           
           echo ""
           echo "✅ 清理完成"
-          echo "   删除旧 Release: $DELETED_COUNT"
-          echo "   保留最新: $LATEST_RELEASE_TAG"
+          echo "   删除: $DELETED_COUNT"
+          echo "   保留: $LATEST_RELEASE_TAG"
 
       # ============================================
-      # 步骤10: 验证
+      # 步骤11: 验证
       # ============================================
       - name: ✅ 验证同步结果
         if: github.event.inputs.skip_release_sync != 'true'
@@ -511,7 +537,7 @@ jobs:
           fi
 
       # ============================================
-      # 步骤11: 结果
+      # 步骤12: 结果
       # ============================================
       - name: 📢 结果
         if: always()
