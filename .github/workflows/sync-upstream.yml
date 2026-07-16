@@ -8,16 +8,9 @@ name: Sync Upstream & Keep Alive
 # 环境变量配置
 # ============================================================
 env:
-  # 【可选】留空则自动检测上游仓库
   UPSTREAM_REPO: ""
-  
-  # 同步模式: "incremental" 或 "force"
   SYNC_MODE: "force"
-  
-  # 只同步最新的 Release
   SYNC_LATEST_ONLY: "true"
-  
-  # 任务超时时间（分钟）
   JOB_TIMEOUT_MINUTES: "30"
 
 # ============================================================
@@ -56,7 +49,7 @@ on:
         default: 'true'
         type: boolean
       cleanup_old_releases:
-        description: '🧹 清理本地旧 Release（只保留最新）'
+        description: '🧹 清理旧 Release（只保留最新）'
         required: false
         default: 'true'
         type: boolean
@@ -242,7 +235,7 @@ jobs:
           echo "📊 上游总 Release 数量: $TOTAL_COUNT"
           
           if [ "$TOTAL_COUNT" -eq 0 ]; then
-            echo "⚠️ 没有 Release"
+            echo "⚠️ 上游没有 Release，跳过同步"
             echo "release_count=0" >> $GITHUB_OUTPUT
             exit 0
           fi
@@ -264,7 +257,8 @@ jobs:
       # 步骤8: 同步 Releases
       # ============================================
       - name: 📦 同步 Releases 与制品
-        if: github.event.inputs.skip_release_sync != 'true'
+        id: sync_releases
+        if: github.event.inputs.skip_release_sync != 'true' && steps.check_releases.outputs.release_count > 0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -390,12 +384,21 @@ jobs:
           
           echo ""
           echo "✅ 所有 Release 同步完成"
+          
+          # 标记同步成功
+          echo "sync_success=true" >> $GITHUB_OUTPUT
 
       # ============================================
-      # 步骤9: 【核心】清理旧 Tags 和 Releases（只保留最新的一个）
+      # 步骤9: 【修复】清理旧 Tags 和 Releases（只保留最新）
+      # 只在同步成功后才执行
       # ============================================
       - name: 🧹 清理旧 Tags 和 Releases（只保留最新）
-        if: github.event.inputs.cleanup_old_releases == 'true'
+        id: cleanup
+        if: |
+          github.event.inputs.cleanup_old_releases == 'true' &&
+          github.event.inputs.skip_release_sync != 'true' &&
+          steps.check_releases.outputs.release_count > 0 &&
+          steps.sync_releases.outputs.sync_success == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -409,50 +412,60 @@ jobs:
           LATEST_TAG=$(git ls-remote --tags upstream | grep -v '\^{}' | sort -V | tail -n1 | awk -F'/' '{print $NF}')
           
           if [ -z "$LATEST_TAG" ]; then
-            echo "⚠️ 无法获取最新 Tag"
+            echo "⚠️ 无法获取最新 Tag，跳过清理"
             exit 0
           fi
           
           echo "📌 最新 Tag: $LATEST_TAG"
           
-          # --- 1. 清理本地 Tags ---
+          # --- 1. 检查本地是否有 Tag ---
+          LOCAL_TAGS=$(git tag -l)
+          
+          if [ -z "$LOCAL_TAGS" ]; then
+            echo "📌 没有本地 Tags，跳过清理"
+            exit 0
+          fi
+          
+          # --- 2. 检查最新 Tag 是否存在 ---
+          if ! git rev-parse "refs/tags/$LATEST_TAG" >/dev/null 2>&1; then
+            echo "⚠️ 最新 Tag $LATEST_TAG 在本地不存在，跳过清理"
+            exit 0
+          fi
+          
           echo ""
           echo "📌 清理本地 Tags..."
           
-          LOCAL_TAGS=$(git tag -l)
           DELETED_TAG_COUNT=0
           KEPT_TAG_COUNT=0
           
-          if [ -n "$LOCAL_TAGS" ]; then
-            for tag in $LOCAL_TAGS; do
-              # 检查本地 Tag 是否存在
-              if ! git rev-parse "refs/tags/$tag" >/dev/null 2>&1; then
-                continue
-              fi
+          for tag in $LOCAL_TAGS; do
+            # 检查本地 Tag 是否存在
+            if ! git rev-parse "refs/tags/$tag" >/dev/null 2>&1; then
+              continue
+            fi
+            
+            if [ "$tag" == "$LATEST_TAG" ]; then
+              echo "   ✅ 保留（最新）: $tag"
+              KEPT_TAG_COUNT=$((KEPT_TAG_COUNT + 1))
+            else
+              echo "   🗑️ 删除 Tag: $tag"
+              git tag -d "$tag" 2>/dev/null || true
+              DELETED_TAG_COUNT=$((DELETED_TAG_COUNT + 1))
               
-              if [ "$tag" == "$LATEST_TAG" ]; then
-                echo "   ✅ 保留（最新）: $tag"
-                KEPT_TAG_COUNT=$((KEPT_TAG_COUNT + 1))
-              else
-                echo "   🗑️ 删除 Tag: $tag"
-                git tag -d "$tag" 2>/dev/null || true
-                DELETED_TAG_COUNT=$((DELETED_TAG_COUNT + 1))
-                
-                # 删除远程 Tag（如果存在）
-                if git ls-remote --tags origin "$tag" 2>/dev/null | grep -q "$tag"; then
-                  echo "      📤 删除远程 Tag: $tag"
-                  git push origin --delete "$tag" 2>/dev/null || true
-                fi
+              # 删除远程 Tag（如果存在）
+              if git ls-remote --tags origin "$tag" 2>/dev/null | grep -q "$tag"; then
+                echo "      📤 删除远程 Tag: $tag"
+                git push origin --delete "$tag" 2>/dev/null || true
               fi
-            done
-          fi
+            fi
+          done
           
           echo ""
           echo "📌 清理 Tags 完成"
           echo "   保留: $KEPT_TAG_COUNT (最新: $LATEST_TAG)"
           echo "   删除: $DELETED_TAG_COUNT"
           
-          # --- 2. 清理 Releases ---
+          # --- 3. 清理 Releases ---
           echo ""
           echo "📌 清理 Releases..."
           
@@ -486,11 +499,8 @@ jobs:
               
               if [ "$RELEASE_ID" != "$LATEST_RELEASE_ID" ]; then
                 echo "   🗑️ 删除 Release: $TAG_NAME"
-                
-                # 删除 Release
                 curl -X DELETE -s -H "Authorization: token $GITHUB_TOKEN" \
                   "https://api.github.com/repos/$CURRENT_REPO/releases/$RELEASE_ID"
-                
                 DELETED_RELEASE_COUNT=$((DELETED_RELEASE_COUNT + 1))
               fi
             done
