@@ -64,7 +64,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     
-    # 授予所有权限（metadata 是无效值，已移除）
     permissions:
       contents: write
       actions: write
@@ -102,24 +101,31 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # 使用 PAT_TOKEN（如果有），否则使用 GITHUB_TOKEN
           token: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+          # 关键：不要用 .netrc，避免认证冲突
+          persist-credentials: true
 
       # ============================================
-      # 步骤3: 配置 Git
+      # 步骤3: 配置 Git（不设置 extraheader，避免冲突）
       # ============================================
       - name: ⚙️ 配置 Git
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git config --global http.https://github.com/.extraheader "Authorization: Bearer ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}"
+          # 不设置 http.extraheader，避免与 Actions 内置认证冲突
+          echo "✅ Git 配置完成"
 
       # ============================================
-      # 步骤4: 添加上游仓库
+      # 步骤4: 添加上游仓库（使用带 token 的 URL）
       # ============================================
       - name: 🔗 添加上游仓库
         run: |
-          UPSTREAM_URL="https://github.com/${{ env.UPSTREAM_REPO }}.git"
-          echo "添加远程仓库: $UPSTREAM_URL"
+          # 构建带 token 的 URL，避免认证问题
+          TOKEN="${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}"
+          UPSTREAM_URL="https://${TOKEN}@github.com/${{ env.UPSTREAM_REPO }}.git"
+          
+          echo "添加远程仓库..."
           git remote add upstream $UPSTREAM_URL || git remote set-url upstream $UPSTREAM_URL
           
           git fetch upstream --tags --prune
@@ -128,26 +134,7 @@ jobs:
           echo "✅ 上游仓库添加成功"
 
       # ============================================
-      # 步骤5: 检查推送权限
-      # ============================================
-      - name: 🔑 检查推送权限
-        run: |
-          echo "=========================================="
-          echo "🔑 检查推送权限"
-          echo "=========================================="
-          
-          if git push origin --dry-run 2>&1 | grep -q "403"; then
-            echo "❌ 推送权限不足！"
-            echo "请执行以下操作之一："
-            echo "1. 在仓库 Settings → Actions → General 中开启 'Read and write permissions'"
-            echo "2. 或者创建 PAT_TOKEN 并添加到 Secrets"
-            exit 1
-          else
-            echo "✅ 推送权限正常"
-          fi
-
-      # ============================================
-      # 步骤6: 禁用上游 Actions
+      # 步骤5: 禁用上游 Actions
       # ============================================
       - name: 🚫 禁用上游 Actions
         if: github.event.inputs.disable_upstream_actions == 'true'
@@ -184,7 +171,7 @@ jobs:
           fi
 
       # ============================================
-      # 步骤7: 合并上游代码
+      # 步骤6: 合并上游代码
       # ============================================
       - name: 🔄 合并上游代码
         id: merge
@@ -212,7 +199,7 @@ jobs:
           echo "✅ 代码同步完成"
 
       # ============================================
-      # 步骤8: 检查上游 Release
+      # 步骤7: 检查上游 Release
       # ============================================
       - name: 🔍 检查上游 Release
         id: check_releases
@@ -251,7 +238,7 @@ jobs:
           echo "release_count=$RELEASE_COUNT" >> $GITHUB_OUTPUT
 
       # ============================================
-      # 步骤9: 同步 Releases 与制品
+      # 步骤8: 同步 Releases 与制品
       # ============================================
       - name: 📦 同步 Releases 与制品
         if: github.event.inputs.skip_release_sync != 'true'
@@ -384,7 +371,7 @@ jobs:
           echo "✅ 所有 Release 同步完成"
 
       # ============================================
-      # 步骤10: 清理
+      # 步骤9: 清理
       # ============================================
       - name: 🧹 清理
         run: |
@@ -392,7 +379,7 @@ jobs:
           git fetch --all --prune
 
       # ============================================
-      # 步骤11: 仓库保活
+      # 步骤10: 仓库保活
       # ============================================
       - name: 💚 仓库保活
         id: keepalive
@@ -420,7 +407,7 @@ jobs:
           echo "📌 仓库活动时间已更新，60天计时器已重置"
 
       # ============================================
-      # 步骤12: 验证
+      # 步骤11: 验证
       # ============================================
       - name: ✅ 验证同步结果
         if: github.event.inputs.skip_release_sync != 'true'
@@ -444,7 +431,7 @@ jobs:
           fi
 
       # ============================================
-      # 步骤13: 结果
+      # 步骤12: 结果
       # ============================================
       - name: 📢 执行结果
         if: always()
