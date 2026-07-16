@@ -264,24 +264,48 @@ jobs:
         run: |
           UPSTREAM_REPO="${{ steps.detect_upstream.outputs.upstream_repo }}"
           SYNC_LATEST_ONLY="${{ github.event.inputs.sync_latest_only || env.SYNC_LATEST_ONLY }}"
-          
+
           echo "=========================================="
           echo "🔍 检查上游: $UPSTREAM_REPO"
           echo "只同步最新: $SYNC_LATEST_ONLY"
           echo "=========================================="
-          
-          ALL_RELEASES=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+
+          # 调用 API 并捕获 HTTP 状态码
+          HTTP_CODE=$(curl -s -o /tmp/upstream_releases_raw.json -w "%{http_code}" \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/$UPSTREAM_REPO/releases?per_page=100")
-          
+
+          echo "📡 API HTTP 状态码: $HTTP_CODE"
+          echo "📄 响应前 300 字符:"
+          head -c 300 /tmp/upstream_releases_raw.json
+          echo ""
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "❌ API 调用失败 (HTTP $HTTP_CODE)"
+            echo "release_count=0" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          ALL_RELEASES=$(cat /tmp/upstream_releases_raw.json)
+
+          # 校验是否为合法 JSON
+          if ! echo "$ALL_RELEASES" | jq empty 2>/dev/null; then
+            echo "❌ API 响应不是合法 JSON"
+            echo "   完整响应: $(head -c 500 /tmp/upstream_releases_raw.json)"
+            echo "release_count=0" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
           TOTAL_COUNT=$(echo "$ALL_RELEASES" | jq '. | length')
           echo "📊 上游总 Release 数量: $TOTAL_COUNT"
-          
+
           if [ "$TOTAL_COUNT" -eq 0 ]; then
             echo "⚠️ 上游没有 Release"
             echo "release_count=0" >> $GITHUB_OUTPUT
             exit 0
           fi
-          
+
           if [ "$SYNC_LATEST_ONLY" == "true" ]; then
             RELEASES=$(echo "$ALL_RELEASES" | jq '[.[0]]')
             RELEASE_COUNT=1
@@ -291,7 +315,7 @@ jobs:
             RELEASES="$ALL_RELEASES"
             RELEASE_COUNT="$TOTAL_COUNT"
           fi
-          
+
           echo "$RELEASES" > /tmp/upstream_releases.json
           echo "release_count=$RELEASE_COUNT" >> $GITHUB_OUTPUT
 
