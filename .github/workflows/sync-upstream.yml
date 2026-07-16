@@ -153,28 +153,28 @@ jobs:
           fi
 
       # ============================================
-      # 步骤4: 配置 Git
+      # 步骤4: 配置 Git（不设置 extraheader，避免冲突）
       # ============================================
       - name: ⚙️ 配置 Git
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          # 配置 Git 使用 GITHUB_TOKEN 认证
-          git config --global http.https://github.com/.extraheader "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}"
+          # 重要：不设置 http.extraheader，避免与 Actions 内置认证冲突
           echo "✅ Git 配置完成"
 
       # ============================================
-      # 步骤5: 添加上游仓库（只获取 Tags，不同步 workflows）
+      # 步骤5: 添加上游仓库（使用 URL 内嵌 token）
       # ============================================
       - name: 🔗 添加上游仓库
         run: |
           UPSTREAM_REPO="${{ steps.detect_upstream.outputs.upstream_repo }}"
-          UPSTREAM_URL="https://github.com/${UPSTREAM_REPO}.git"
+          # 使用 GITHUB_TOKEN 内嵌在 URL 中
+          UPSTREAM_URL="https://${{ secrets.GITHUB_TOKEN }}@github.com/${UPSTREAM_REPO}.git"
           
           echo "上游仓库: $UPSTREAM_REPO"
           git remote add upstream $UPSTREAM_URL || git remote set-url upstream $UPSTREAM_URL
           
-          # 【关键】只 fetch tags，不 fetch 代码，避免 workflows 文件
+          # 只 fetch tags，不 fetch 代码
           git fetch upstream --tags --prune --force
           
           echo "✅ 上游仓库添加成功"
@@ -183,7 +183,7 @@ jobs:
           git ls-remote --tags upstream | grep -v '\^{}' | tail -5
 
       # ============================================
-      # 步骤6: 禁用上游 Actions（如果有）
+      # 步骤6: 禁用上游 Actions
       # ============================================
       - name: 🚫 禁用上游 Actions
         if: github.event.inputs.disable_upstream_actions == 'true'
@@ -261,7 +261,7 @@ jobs:
           echo "release_count=$RELEASE_COUNT" >> $GITHUB_OUTPUT
 
       # ============================================
-      # 步骤8: 同步 Releases（通过 API，不涉及 workflows）
+      # 步骤8: 同步 Releases
       # ============================================
       - name: 📦 同步 Releases 与制品
         id: sync_releases
@@ -299,23 +299,20 @@ jobs:
             echo "   制品数量: $ASSET_COUNT"
             echo "=========================================="
             
-            # --- 【关键】只创建 Tag，不包含 workflows ---
-            # 使用 API 创建 Tag（不会触发 workflows 权限问题）
-            echo "   📌 通过 API 创建/更新 Tag..."
-            
-            # 获取上游 Tag 的 commit SHA
-            # 首先获取上游仓库的默认分支最新 commit
+            # --- 获取上游 Tag 的 commit SHA ---
+            # 获取上游仓库的默认分支最新 commit
             DEFAULT_BRANCH=$(git remote show upstream | grep 'HEAD branch' | cut -d' ' -f5)
             TARGET_SHA=$(git rev-parse upstream/$DEFAULT_BRANCH)
+            echo "   📌 目标 commit: $TARGET_SHA"
             
-            # 使用 API 创建 Tag（引用）
-            # 先检查 Tag 是否存在
+            # --- 通过 API 创建/更新 Tag ---
+            echo "   📌 通过 API 创建/更新 Tag..."
+            
             TAG_EXISTS=$(curl -s -o /dev/null -w "%{http_code}" \
               -H "Authorization: token $GITHUB_TOKEN" \
               "https://api.github.com/repos/$CURRENT_REPO/git/refs/tags/$TAG_NAME")
             
             if [ "$TAG_EXISTS" == "200" ]; then
-              echo "   ⚠️ Tag 已存在，更新指向..."
               # 更新 Tag 引用
               curl -s -X PATCH \
                 -H "Authorization: token $GITHUB_TOKEN" \
@@ -325,6 +322,7 @@ jobs:
                   \"force\": true
                 }" \
                 "https://api.github.com/repos/$CURRENT_REPO/git/refs/tags/$TAG_NAME" > /dev/null
+              echo "   ✅ Tag 已更新"
             else
               # 创建 Tag 引用
               curl -s -X POST \
@@ -335,8 +333,8 @@ jobs:
                   \"sha\": \"$TARGET_SHA\"
                 }" \
                 "https://api.github.com/repos/$CURRENT_REPO/git/refs" > /dev/null
+              echo "   ✅ Tag 已创建"
             fi
-            echo "   ✅ Tag 创建/更新成功"
             
             # --- 处理 Release ---
             RELEASE_EXISTS=$(curl -s -o /dev/null -w "%{http_code}" \
@@ -419,7 +417,7 @@ jobs:
       # ============================================
       # 步骤9: 清理旧 Tags 和 Releases（只保留最新）
       # ============================================
-      - name: 🧹 清理旧 Tags 和 Releases（只保留最新）
+      - name: 🧹 清理旧 Releases（只保留最新）
         id: cleanup
         if: |
           github.event.inputs.cleanup_old_releases == 'true' &&
@@ -430,7 +428,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "=========================================="
-          echo "🧹 清理旧 Tags 和 Releases（只保留最新）"
+          echo "🧹 清理旧 Releases（只保留最新）"
           echo "=========================================="
           
           CURRENT_REPO="${{ github.repository }}"
@@ -448,16 +446,14 @@ jobs:
           
           echo "📊 当前 Release 数量: $TOTAL_COUNT"
           
-          # 获取最新的 Release（第一个）
+          # 获取最新的 Release
           LATEST_RELEASE_TAG=$(echo "$RELEASES" | jq -r '.[0].tag_name')
           LATEST_RELEASE_ID=$(echo "$RELEASES" | jq -r '.[0].id')
           
           echo "📌 最新 Release: $LATEST_RELEASE_TAG"
           echo ""
-          echo "将要删除的旧 Release:"
           
-          DELETED_RELEASE_COUNT=0
-          DELETED_TAG_COUNT=0
+          DELETED_COUNT=0
           
           echo "$RELEASES" | jq -c '.[]' | while read release; do
             TAG_NAME=$(echo $release | jq -r '.tag_name')
@@ -469,23 +465,18 @@ jobs:
               # 删除 Release
               curl -X DELETE -s -H "Authorization: token $GITHUB_TOKEN" \
                 "https://api.github.com/repos/$CURRENT_REPO/releases/$RELEASE_ID"
-              DELETED_RELEASE_COUNT=$((DELETED_RELEASE_COUNT + 1))
               
-              # 删除对应的 Tag
-              if git rev-parse "refs/tags/$TAG_NAME" >/dev/null 2>&1; then
-                git tag -d "$TAG_NAME" 2>/dev/null || true
-                # 通过 API 删除 Tag 引用
-                curl -X DELETE -s -H "Authorization: token $GITHUB_TOKEN" \
-                  "https://api.github.com/repos/$CURRENT_REPO/git/refs/tags/$TAG_NAME" 2>/dev/null || true
-                DELETED_TAG_COUNT=$((DELETED_TAG_COUNT + 1))
-              fi
+              # 删除对应的 Tag 引用
+              curl -X DELETE -s -H "Authorization: token $GITHUB_TOKEN" \
+                "https://api.github.com/repos/$CURRENT_REPO/git/refs/tags/$TAG_NAME" 2>/dev/null || true
+              
+              DELETED_COUNT=$((DELETED_COUNT + 1))
             fi
           done
           
           echo ""
           echo "✅ 清理完成"
-          echo "   删除旧 Release: $DELETED_RELEASE_COUNT"
-          echo "   删除旧 Tag: $DELETED_TAG_COUNT"
+          echo "   删除旧 Release: $DELETED_COUNT"
           echo "   保留最新: $LATEST_RELEASE_TAG"
 
       # ============================================
@@ -518,10 +509,6 @@ jobs:
           else
             echo "⚠️ 没有 Release"
           fi
-          
-          echo ""
-          echo "📌 本地 Tags:"
-          git tag -l | sed 's/^/   /'
 
       # ============================================
       # 步骤11: 结果
