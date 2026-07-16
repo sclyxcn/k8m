@@ -1,0 +1,80 @@
+name: Sync Releases from Original
+
+on:
+  # 手动触发工作流，这样你可以按需执行
+  workflow_dispatch:
+  # 也可以设置定时触发，例如每天凌晨2点检查一次
+  # schedule:
+  #   - cron: '0 2 * * *'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. 检出你的复刻仓库
+      - name: Checkout your forked repo
+        uses: actions/checkout@v4
+
+      # 2. 从原仓库获取所有Release信息
+      - name: Get Original Releases
+        id: get_releases
+        run: |
+          # 请将 OWNER/REPO 替换为原仓库的拥有者和仓库名
+          ORIGINAL_REPO="weibaohui/k8m"
+          RELEASES=$(curl -s "https://api.github.com/repos/$ORIGINAL_REPO/releases")
+          echo "releases=$RELEASES" >> $GITHUB_OUTPUT
+
+      # 3. 遍历每个Release并同步
+      - name: Sync Each Release
+        env:
+          # 使用 GitHub 自动提供的 GITHUB_TOKEN 进行身份认证
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 解析上一步获取的JSON数据
+          echo '${{ steps.get_releases.outputs.releases }}' | jq -c '.[]' | while read release; do
+            TAG_NAME=$(echo $release | jq -r '.tag_name')
+            RELEASE_ID=$(echo $release | jq -r '.id')
+            
+            echo "正在同步 Release: $TAG_NAME"
+            
+            # 检查你的复刻仓库中是否已存在该Tag
+            if git rev-parse "refs/tags/$TAG_NAME" >/dev/null 2>&1; then
+              echo "Tag $TAG_NAME 已存在，跳过创建。"
+            else
+              echo "创建 Tag: $TAG_NAME"
+              # 获取该Release对应的commit SHA
+              TARGET_SHA=$(echo $release | jq -r '.target_commitish')
+              # 如果没有指定，则用仓库的默认分支
+              if [ "$TARGET_SHA" == "null" ]; then
+                TARGET_SHA="main"
+              fi
+              # 在本地创建Tag
+              git tag "$TAG_NAME" "$TARGET_SHA"
+              # 推送Tag到你的复刻仓库
+              git push origin "$TAG_NAME"
+            fi
+            
+            # 获取原Release的资产(制品)列表
+            ASSETS=$(echo $release | jq -c '.assets[]')
+            if [ -z "$ASSETS" ]; then
+              echo "Release $TAG_NAME 没有资产文件，跳过。"
+              continue
+            fi
+            
+            # 下载所有资产并上传到你的Release
+            echo "$ASSETS" | while read asset; do
+              ASSET_NAME=$(echo $asset | jq -r '.name')
+              ASSET_URL=$(echo $asset | jq -r '.browser_download_url')
+              
+              echo "下载资产: $ASSET_NAME"
+              wget -q "$ASSET_URL" -O "$ASSET_NAME"
+              
+              echo "上传资产到你的 Release: $TAG_NAME"
+              # 使用 gh 命令行工具上传资产到你的Release
+              gh release upload "$TAG_NAME" "$ASSET_NAME" --clobber
+              
+              # 清理下载的文件
+              rm "$ASSET_NAME"
+            done
+          done
