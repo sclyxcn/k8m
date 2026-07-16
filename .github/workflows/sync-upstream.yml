@@ -170,32 +170,67 @@ jobs:
           fi
 
       # ============================================
-      # 步骤4: 配置 Git
+      # 步骤4: 配置 Git（不设置 extraheader，避免冲突）
       # ============================================
       - name: ⚙️ 配置 Git
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          # 配置 Git 使用 PAT 认证（解决推送权限问题）
-          git config --global http.https://github.com/.extraheader "Authorization: Bearer ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}"
+          # 重要：不要设置 http.extraheader，避免与 Actions 内置认证冲突
           echo "✅ Git 配置完成"
 
       # ============================================
-      # 步骤5: 添加上游仓库（使用 PAT）
+      # 步骤5: 添加上游仓库（带重试机制）
       # ============================================
       - name: 🔗 添加上游仓库
+        id: add_upstream
         run: |
           UPSTREAM_REPO="${{ steps.detect_upstream.outputs.upstream_repo }}"
           TOKEN="${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}"
+          # 使用 URL 内嵌 token 的方式，不设置 extraheader
           UPSTREAM_URL="https://${TOKEN}@github.com/${UPSTREAM_REPO}.git"
           
           echo "上游仓库: $UPSTREAM_REPO"
-          git remote add upstream $UPSTREAM_URL || git remote set-url upstream $UPSTREAM_URL
           
-          git fetch upstream --tags --prune --force
-          git fetch upstream --prune
+          # 重试函数
+          retry() {
+            local max_attempts=3
+            local attempt=1
+            local exit_code=0
+            
+            while [ $attempt -le $max_attempts ]; do
+              echo "尝试 $attempt/$max_attempts..."
+              if eval "$@"; then
+                echo "✅ 成功！"
+                return 0
+              else
+                exit_code=$?
+                echo "⚠️ 失败 (exit code: $exit_code)"
+                if [ $attempt -lt $max_attempts ]; then
+                  echo "等待 5 秒后重试..."
+                  sleep 5
+                fi
+                attempt=$((attempt + 1))
+              fi
+            done
+            
+            echo "❌ 所有 $max_attempts 次尝试均失败"
+            return $exit_code
+          }
+          
+          # 使用重试添加远程仓库
+          retry "git remote add upstream $UPSTREAM_URL || git remote set-url upstream $UPSTREAM_URL"
+          
+          # 使用重试 fetch
+          retry "git fetch upstream --tags --prune --force"
+          retry "git fetch upstream --prune"
           
           echo "✅ 上游仓库添加成功"
+          
+          # 显示 fetch 结果
+          echo ""
+          echo "📌 上游 Tags 列表:"
+          git ls-remote --tags upstream | grep -v '\^{}' | tail -5
 
       # ============================================
       # 步骤6: 清理本地历史 Tags（检查是否存在后再删除）
@@ -231,7 +266,7 @@ jobs:
           echo "遍历本地 Tags..."
           for tag in $LOCAL_TAGS; do
             if [ "$tag" != "$LATEST_TAG" ]; then
-              # 检查 Tag 是否存在
+              # 检查本地 Tag 是否存在
               if git rev-parse "refs/tags/$tag" >/dev/null 2>&1; then
                 echo "   🗑️ 删除本地 Tag: $tag"
                 git tag -d "$tag" 2>/dev/null || true
@@ -322,7 +357,7 @@ jobs:
           fi
 
       # ============================================
-      # 步骤8: 合并上游代码
+      # 步骤8: 合并上游代码（带重试）
       # ============================================
       - name: 🔄 合并上游代码
         id: merge
@@ -336,9 +371,35 @@ jobs:
           
           MERGE_STRATEGY="${{ env.MERGE_STRATEGY }}"
           
-          git pull upstream $UPSTREAM_BRANCH --no-edit || {
+          # 重试函数
+          retry() {
+            local max_attempts=3
+            local attempt=1
+            local exit_code=0
+            
+            while [ $attempt -le $max_attempts ]; do
+              echo "尝试 $attempt/$max_attempts..."
+              if eval "$@"; then
+                echo "✅ 成功！"
+                return 0
+              else
+                exit_code=$?
+                echo "⚠️ 失败 (exit code: $exit_code)"
+                if [ $attempt -lt $max_attempts ]; then
+                  echo "等待 5 秒后重试..."
+                  sleep 5
+                fi
+                attempt=$((attempt + 1))
+              fi
+            done
+            
+            echo "❌ 所有 $max_attempts 次尝试均失败"
+            return $exit_code
+          }
+          
+          retry "git pull upstream $UPSTREAM_BRANCH --no-edit" || {
             echo "合并冲突，使用 $MERGE_STRATEGY 策略..."
-            git pull upstream $UPSTREAM_BRANCH -X recursive -X $MERGE_STRATEGY --no-edit || {
+            retry "git pull upstream $UPSTREAM_BRANCH -X recursive -X $MERGE_STRATEGY --no-edit" || {
               echo "❌ 合并失败"
               exit 1
             }
@@ -407,7 +468,7 @@ jobs:
           echo "release_count=$RELEASE_COUNT" >> $GITHUB_OUTPUT
 
       # ============================================
-      # 步骤10: 同步 Releases（使用 PAT 推送）
+      # 步骤10: 同步 Releases（使用 PAT 推送 + 重试）
       # ============================================
       - name: 📦 同步 Releases 与制品
         id: sync_releases
@@ -421,6 +482,32 @@ jobs:
           CURRENT_REPO="${{ github.repository }}"
           RELEASE_COUNT="${{ steps.check_releases.outputs.release_count }}"
           TOKEN="${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}"
+          
+          # 重试函数
+          retry() {
+            local max_attempts=3
+            local attempt=1
+            local exit_code=0
+            
+            while [ $attempt -le $max_attempts ]; do
+              echo "   尝试 $attempt/$max_attempts..."
+              if eval "$@"; then
+                echo "   ✅ 成功！"
+                return 0
+              else
+                exit_code=$?
+                echo "   ⚠️ 失败 (exit code: $exit_code)"
+                if [ $attempt -lt $max_attempts ]; then
+                  echo "   等待 5 秒后重试..."
+                  sleep 5
+                fi
+                attempt=$((attempt + 1))
+              fi
+            done
+            
+            echo "   ❌ 所有 $max_attempts 次尝试均失败"
+            return $exit_code
+          }
           
           echo "=========================================="
           echo "📦 同步 Releases"
@@ -461,8 +548,8 @@ jobs:
               git tag -d "$TAG_NAME"
             fi
             
-            # 从上游 fetch Tag
-            git fetch upstream "refs/tags/$TAG_NAME:refs/tags/$TAG_NAME" --force 2>/dev/null || {
+            # 从上游 fetch Tag（带重试）
+            retry "git fetch upstream 'refs/tags/$TAG_NAME:refs/tags/$TAG_NAME' --force" 2>/dev/null || {
               echo "   ⚠️ 无法直接 fetch Tag，通过 SHA 创建..."
               if [ "$TARGET_SHA" == "null" ] || [ -z "$TARGET_SHA" ]; then
                 DEFAULT_BRANCH=$(git remote show upstream | grep 'HEAD branch' | cut -d' ' -f5)
@@ -471,15 +558,11 @@ jobs:
               git tag -f "$TAG_NAME" "$TARGET_SHA"
             }
             
-            # 使用 PAT 强制推送 Tag（解决 workflows 权限问题）
-            echo "   📤 使用 PAT 推送 Tag 到 origin..."
-            git push "https://${TOKEN}@github.com/${CURRENT_REPO}" "refs/tags/${TAG_NAME}" -f || {
+            # 使用 PAT 强制推送 Tag（带重试）
+            echo "   📤 推送 Tag 到 origin..."
+            retry "git push 'https://${TOKEN}@github.com/${CURRENT_REPO}' 'refs/tags/${TAG_NAME}' -f" || {
               echo "   ❌ Tag 推送失败"
               echo "   请确保 PAT_TOKEN 有 repo 和 workflow 权限"
-              echo "   PAT_TOKEN 配置步骤:"
-              echo "   1. GitHub Settings → Developer settings → Personal access tokens"
-              echo "   2. 生成新 token，勾选 repo 和 workflow 权限"
-              echo "   3. 在仓库 Secrets 中添加 PAT_TOKEN"
               exit 1
             }
             echo "   ✅ Tag 推送成功"
@@ -545,15 +628,14 @@ jobs:
               fi
               
               echo "     📥 下载: $ASSET_NAME ($ASSET_SIZE_HR)"
-              wget -q --tries=3 --timeout=300 "$ASSET_URL" -O "$ASSET_NAME" || {
+              retry "wget -q --tries=3 --timeout=300 '$ASSET_URL' -O '$ASSET_NAME'" || {
                 echo "     ❌ 下载失败"
                 continue
               }
               
               echo "     📤 上传: $ASSET_NAME"
-              gh release upload "$TAG_NAME" "$ASSET_NAME" --clobber --repo "$CURRENT_REPO" || {
-                echo "     ⚠️ 上传失败，重试..."
-                gh release upload "$TAG_NAME" "$ASSET_NAME" --clobber --repo "$CURRENT_REPO" || true
+              retry "gh release upload '$TAG_NAME' '$ASSET_NAME' --clobber --repo '$CURRENT_REPO'" || {
+                echo "     ⚠️ 上传失败，跳过"
               }
               
               rm -f "$ASSET_NAME"
