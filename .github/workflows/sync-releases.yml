@@ -5,31 +5,23 @@
 name: Sync Upstream & Keep Alive
 
 # ============================================================
-# 环境变量配置
+# 环境变量配置（仅在 job 的 steps 中可用，不能在 on 中使用）
 # ============================================================
 env:
   # 【必填】上游仓库的完整名称，格式: "owner/repo"
-  UPSTREAM_REPO: "weibaohui/k8m"  # <--- 请修改为实际的仓库名
+  UPSTREAM_REPO: "weibaohui/k8m"
   
   # 同步模式: "incremental"（增量） 或 "force"（强制覆盖）
-  #   - incremental: 只新增缺失的制品，保留已有制品（日常推荐）
-  #   - force: 删除所有现有制品，完全复制上游（首次推荐）
   SYNC_MODE: "incremental"
   
   # 代码合并策略: "ours"（保留本地）或 "theirs"（使用上游）
-  #   - ours: 冲突时优先保留本地修改（适合有定制化的仓库）
-  #   - theirs: 冲突时优先使用上游代码（适合完全跟随上游）
   MERGE_STRATEGY: "ours"
-  
-  # 定时同步: 每5天凌晨3点执行（同步代码 + 制品 + 保活）
-  # 注意: 间隔不能超过60天，否则Actions会被自动禁用
-  SCHEDULE_CRON: "0 3 */5 * *"
   
   # 任务超时时间（分钟）
   JOB_TIMEOUT_MINUTES: "30"
 
 # ============================================================
-# 触发器配置
+# 触发器配置（不能使用 env 变量，直接写死）
 # ============================================================
 
 on:
@@ -55,10 +47,15 @@ on:
         required: false
         default: 'false'
         type: boolean
+      disable_upstream_actions:
+        description: '🚫 禁用上游仓库的 Actions（删除 .github/workflows/*.yml）'
+        required: false
+        default: 'true'
+        type: boolean
   
-  # 2. 定时触发 - 每5天自动执行
+  # 2. 定时触发 - 每5天凌晨3点执行（直接写死 cron 表达式）
   schedule:
-    - cron: ${{ env.SCHEDULE_CRON }}
+    - cron: "0 3 */5 * *"
 
 # ============================================================
 # 任务配置
@@ -67,9 +64,9 @@ on:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ fromJSON(env.JOB_TIMEOUT_MINUTES) }}
+    timeout-minutes: 30  # 直接写死，不使用 env 变量
     
-    # 并发控制：防止多个同步任务同时运行导致冲突
+    # 并发控制
     concurrency:
       group: sync-upstream
       cancel-in-progress: false
@@ -86,7 +83,7 @@ jobs:
           echo "上游仓库: ${{ env.UPSTREAM_REPO }}"
           echo "同步模式: ${{ env.SYNC_MODE }}"
           echo "合并策略: ${{ env.MERGE_STRATEGY }}"
-          echo "定时计划: ${{ env.SCHEDULE_CRON }}"
+          echo "定时计划: 0 3 */5 * * (每5天凌晨3点)"
           echo "超时时间: ${{ env.JOB_TIMEOUT_MINUTES }} 分钟"
           echo "=========================================="
           
@@ -101,7 +98,7 @@ jobs:
       - name: 📥 检出复刻仓库
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # 获取完整历史，便于合并
+          fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
       # ============================================
@@ -113,7 +110,63 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
       # ============================================
-      # 步骤4: 添加上游仓库
+      # 步骤4: 【新增】禁用上游仓库的 Actions
+      # ============================================
+      - name: 🚫 禁用上游 Actions
+        if: github.event.inputs.disable_upstream_actions == 'true'
+        run: |
+          echo "=========================================="
+          echo "🚫 禁用上游仓库的 Actions"
+          echo "=========================================="
+          
+          # 检查是否存在 .github/workflows 目录
+          if [ -d ".github/workflows" ]; then
+            echo "发现 .github/workflows 目录，正在禁用..."
+            
+            # 方案1: 删除所有 workflow 文件（推荐）
+            # 但保留当前工作流文件本身（sync-upstream.yml）
+            CURRENT_FILE="sync-upstream.yml"
+            
+            # 获取当前工作流文件名
+            CURRENT_WORKFLOW=$(basename "${{ github.workflow_ref }}" | cut -d'/' -f2 || echo "")
+            if [ -z "$CURRENT_WORKFLOW" ]; then
+              # 如果无法获取，使用默认名称
+              CURRENT_WORKFLOW="sync-upstream.yml"
+            fi
+            
+            echo "当前工作流文件: $CURRENT_WORKFLOW"
+            
+            # 删除所有 workflow 文件，但保留当前文件
+            find .github/workflows -name "*.yml" -o -name "*.yaml" | while read file; do
+              filename=$(basename "$file")
+              if [ "$filename" != "$CURRENT_WORKFLOW" ] && [ "$filename" != "sync-upstream.yml" ]; then
+                echo "  删除: $file"
+                rm -f "$file"
+              else
+                echo "  保留: $file (当前工作流)"
+              fi
+            done
+            
+            # 方案2: 如果只想禁用而不删除，可以重命名为 .disabled
+            # find .github/workflows -name "*.yml" ! -name "$CURRENT_WORKFLOW" -exec mv {} {}.disabled \;
+            
+            # 提交更改
+            if git status --porcelain | grep -q ".github/workflows"; then
+              git add .github/workflows/
+              git commit -m "[skip ci] 禁用上游 Actions，仅保留同步工作流"
+              git push origin $(git branch --show-current)
+              echo "✅ 上游 Actions 已禁用"
+            else
+              echo "✅ 没有需要禁用的 Actions（可能已被禁用）"
+            fi
+          else
+            echo "⚠️ .github/workflows 目录不存在，无需禁用"
+          fi
+          
+          echo "=========================================="
+
+      # ============================================
+      # 步骤5: 添加上游仓库
       # ============================================
       - name: 🔗 添加上游仓库
         run: |
@@ -127,7 +180,7 @@ jobs:
           echo "✅ 上游仓库添加成功"
 
       # ============================================
-      # 步骤5: 合并上游代码（更新复刻工程）
+      # 步骤6: 合并上游代码（更新复刻工程）
       # ============================================
       - name: 🔄 合并上游代码
         id: merge
@@ -157,7 +210,7 @@ jobs:
           echo "✅ 代码同步完成"
 
       # ============================================
-      # 步骤6: 检查上游 Release
+      # 步骤7: 检查上游 Release
       # ============================================
       - name: 🔍 检查上游 Release
         id: check_releases
@@ -200,7 +253,7 @@ jobs:
           echo "release_count=$RELEASE_COUNT" >> $GITHUB_OUTPUT
 
       # ============================================
-      # 步骤7: 同步 Releases 与制品
+      # 步骤8: 同步 Releases 与制品
       # ============================================
       - name: 📦 同步 Releases 与制品
         if: github.event.inputs.skip_release_sync != 'true'
@@ -343,7 +396,7 @@ jobs:
           echo "✅ 所有 Release 同步完成"
 
       # ============================================
-      # 步骤8: 清理远程分支引用
+      # 步骤9: 清理远程分支引用
       # ============================================
       - name: 🧹 清理
         run: |
@@ -351,7 +404,7 @@ jobs:
           git fetch --all --prune
 
       # ============================================
-      # 步骤9: 【核心保活】制造仓库活动
+      # 步骤10: 【核心保活】制造仓库活动
       # ============================================
       - name: 💚 仓库保活
         id: keepalive
@@ -364,7 +417,6 @@ jobs:
           echo "当前时间: $CURRENT_TIME"
           echo "下次定时执行: $(date -u -d '5 days' '+%Y-%m-%d %H:%M:%S UTC')"
           
-          # ---- 方法1: 创建空提交（制造活动） ----
           # 检查最近一次提交是否来自本工作流
           LAST_COMMIT_MSG=$(git log -1 --pretty=%B)
           
@@ -372,25 +424,17 @@ jobs:
             echo "最近提交已是保活提交，跳过创建新提交"
           else
             echo "创建保活空提交..."
-            # 创建空提交，使用 [skip ci] 避免触发其他 CI 任务
             git commit --allow-empty -m "[skip ci] keepalive: 仓库保活 $(date -u '+%Y-%m-%d')"
             git push origin $(git branch --show-current)
             echo "✅ 保活提交已推送"
           fi
-          
-          # ---- 方法2: 创建一个保活标记文件（可选） ----
-          # 如果不想用空提交污染历史，可以创建一个文件并提交
-          # echo "$CURRENT_TIME" > .github/.keepalive
-          # git add .github/.keepalive
-          # git commit -m "[skip ci] keepalive: 更新时间戳"
-          # git push
           
           echo ""
           echo "✅ 仓库保活完成"
           echo "📌 仓库活动时间已更新，60天计时器已重置"
 
       # ============================================
-      # 步骤10: 验证同步结果
+      # 步骤11: 验证同步结果
       # ============================================
       - name: ✅ 验证同步结果
         if: github.event.inputs.skip_release_sync != 'true'
@@ -415,7 +459,7 @@ jobs:
           fi
 
       # ============================================
-      # 步骤11: 执行结果通知
+      # 步骤12: 执行结果通知
       # ============================================
       - name: 📢 执行结果
         if: always()
