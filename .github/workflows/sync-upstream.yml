@@ -29,7 +29,9 @@ on:
   workflow_dispatch:
     inputs:
       sync_mode_override:
-        description: '🔁 同步模式（force=强制删除重建，incremental=增量保留）'
+        description: >
+          🔁 同步模式
+          force=强制删除重建 | incremental=增量保留
         required: false
         default: 'force'
         type: choice
@@ -37,22 +39,30 @@ on:
           - 'force'
           - 'incremental'
       sync_latest_only:
-        description: '📌 只同步最新版本（开启=只同步最新并清理旧版，关闭=同步全部版本）'
+        description: >
+          📌 只同步最新版本
+          开启=只同步最新并清理旧版 | 关闭=同步全部版本
         required: false
         default: true
         type: boolean
       skip_code_sync:
-        description: '⏭️ 跳过代码同步（只同步 Release）'
+        description: >
+          ⏭️ 跳过代码同步
+          开启=只同步 Release 不同步代码
         required: false
         default: false
         type: boolean
       skip_release_sync:
-        description: '⏭️ 跳过 Release 同步（只同步代码）'
+        description: >
+          ⏭️ 跳过 Release 同步
+          开启=只同步代码不同步 Release
         required: false
         default: false
         type: boolean
       disable_upstream_actions:
-        description: '🚫 删除上游工作流文件和历史记录'
+        description: >
+          🚫 删除上游工作流
+          开启=删除上游 workflow 文件和历史记录 | 关闭=保留
         required: false
         default: true
         type: boolean
