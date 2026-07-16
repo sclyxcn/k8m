@@ -91,13 +91,40 @@ jobs:
 
     steps:
       # ============================================
-      # 步骤1: 检出复刻仓库
+      # 步骤0: 检查 PAT_TOKEN 是否配置
+      # ============================================
+      - name: 🔑 检查 PAT_TOKEN
+        id: check_token
+        run: |
+          echo "=========================================="
+          echo "🔑 检查 PAT_TOKEN 配置"
+          echo "=========================================="
+          
+          if [ -n "${{ secrets.PAT_TOKEN }}" ]; then
+            echo "✅ PAT_TOKEN 已配置"
+            echo "token_configured=true" >> $GITHUB_OUTPUT
+          else
+            echo "❌ PAT_TOKEN 未配置！"
+            echo ""
+            echo "请按以下步骤配置："
+            echo "1. GitHub Settings → Developer settings → Personal access tokens → Tokens (classic)"
+            echo "2. Generate new token (classic)"
+            echo "3. 勾选权限: repo (全部) 和 workflow"
+            echo "4. 复制 token"
+            echo "5. 在仓库 Settings → Secrets and variables → Actions 中添加 PAT_TOKEN"
+            echo ""
+            echo "⚠️ 没有 PAT_TOKEN 将无法推送 Tags（GITHUB_TOKEN 没有 workflows 权限）"
+            exit 1
+          fi
+
+      # ============================================
+      # 步骤1: 检出复刻仓库（使用 PAT）
       # ============================================
       - name: 📥 检出复刻仓库
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.PAT_TOKEN }}  # 强制使用 PAT
           persist-credentials: true
 
       # ============================================
@@ -106,7 +133,7 @@ jobs:
       - name: 🔍 自动检测上游仓库
         id: detect_upstream
         env:
-          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}  # 强制使用 PAT
         run: |
           echo "=========================================="
           echo "🔍 自动检测上游仓库"
@@ -170,29 +197,27 @@ jobs:
           fi
 
       # ============================================
-      # 步骤4: 配置 Git（不设置 extraheader，避免冲突）
+      # 步骤4: 配置 Git（不设置 extraheader）
       # ============================================
       - name: ⚙️ 配置 Git
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          # 重要：不要设置 http.extraheader，避免与 Actions 内置认证冲突
           echo "✅ Git 配置完成"
 
       # ============================================
-      # 步骤5: 添加上游仓库（带重试机制）
+      # 步骤5: 添加上游仓库（使用 PAT）
       # ============================================
       - name: 🔗 添加上游仓库
         id: add_upstream
         run: |
           UPSTREAM_REPO="${{ steps.detect_upstream.outputs.upstream_repo }}"
-          TOKEN="${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}"
-          # 使用 URL 内嵌 token 的方式，不设置 extraheader
+          TOKEN="${{ secrets.PAT_TOKEN }}"
           UPSTREAM_URL="https://${TOKEN}@github.com/${UPSTREAM_REPO}.git"
           
           echo "上游仓库: $UPSTREAM_REPO"
+          echo "使用 PAT 认证..."
           
-          # 重试函数
           retry() {
             local max_attempts=3
             local attempt=1
@@ -218,22 +243,14 @@ jobs:
             return $exit_code
           }
           
-          # 使用重试添加远程仓库
           retry "git remote add upstream $UPSTREAM_URL || git remote set-url upstream $UPSTREAM_URL"
-          
-          # 使用重试 fetch
           retry "git fetch upstream --tags --prune --force"
           retry "git fetch upstream --prune"
           
           echo "✅ 上游仓库添加成功"
-          
-          # 显示 fetch 结果
-          echo ""
-          echo "📌 上游 Tags 列表:"
-          git ls-remote --tags upstream | grep -v '\^{}' | tail -5
 
       # ============================================
-      # 步骤6: 清理本地历史 Tags（检查是否存在后再删除）
+      # 步骤6: 清理本地历史 Tags
       # ============================================
       - name: 🧹 清理本地历史 Tags
         if: github.event.inputs.cleanup_old_tags == 'true'
@@ -242,7 +259,6 @@ jobs:
           echo "🧹 清理本地历史 Tags"
           echo "=========================================="
           
-          # 获取上游最新的 Tag
           LATEST_TAG=$(git ls-remote --tags upstream | grep -v '\^{}' | sort -V | tail -n1 | awk -F'/' '{print $NF}')
           
           if [ -z "$LATEST_TAG" ]; then
@@ -252,7 +268,6 @@ jobs:
           
           echo "📌 最新 Tag: $LATEST_TAG"
           
-          # 获取所有本地 Tag
           LOCAL_TAGS=$(git tag -l)
           
           if [ -z "$LOCAL_TAGS" ]; then
@@ -263,16 +278,13 @@ jobs:
           DELETED_COUNT=0
           KEPT_COUNT=0
           
-          echo "遍历本地 Tags..."
           for tag in $LOCAL_TAGS; do
             if [ "$tag" != "$LATEST_TAG" ]; then
-              # 检查本地 Tag 是否存在
               if git rev-parse "refs/tags/$tag" >/dev/null 2>&1; then
                 echo "   🗑️ 删除本地 Tag: $tag"
                 git tag -d "$tag" 2>/dev/null || true
                 DELETED_COUNT=$((DELETED_COUNT + 1))
                 
-                # 检查远程 Tag 是否存在
                 if git ls-remote --tags origin "$tag" | grep -q "$tag"; then
                   echo "      📤 删除远程 Tag: $tag"
                   git push origin --delete "$tag" 2>/dev/null || true
@@ -312,9 +324,6 @@ jobs:
           CURRENT_WORKFLOW_FILE="sync-upstream.yml"
           SAFE_NAMES="sync-upstream.yml sync-upstream.yaml"
           
-          DISABLED_COUNT=0
-          KEPT_COUNT=0
-          
           find .github/workflows -maxdepth 1 -name "*.yml" -o -name "*.yaml" | while read file; do
             filename=$(basename "$file")
             
@@ -328,7 +337,6 @@ jobs:
             
             if [ "$is_safe" == "true" ]; then
               echo "   🔒 保护: $file"
-              KEPT_COUNT=$((KEPT_COUNT + 1))
               continue
             fi
             
@@ -340,12 +348,7 @@ jobs:
             new_file="${file}.disabled"
             echo "   🚫 禁用: $file → $new_file"
             mv "$file" "$new_file"
-            DISABLED_COUNT=$((DISABLED_COUNT + 1))
           done
-          
-          echo ""
-          echo "禁用文件数: $DISABLED_COUNT"
-          echo "保留文件数: $KEPT_COUNT"
           
           if git status --porcelain | grep -q ".github/workflows"; then
             git add .github/workflows/
@@ -357,7 +360,7 @@ jobs:
           fi
 
       # ============================================
-      # 步骤8: 合并上游代码（带重试）
+      # 步骤8: 合并上游代码
       # ============================================
       - name: 🔄 合并上游代码
         id: merge
@@ -371,30 +374,20 @@ jobs:
           
           MERGE_STRATEGY="${{ env.MERGE_STRATEGY }}"
           
-          # 重试函数
           retry() {
             local max_attempts=3
             local attempt=1
-            local exit_code=0
-            
             while [ $attempt -le $max_attempts ]; do
               echo "尝试 $attempt/$max_attempts..."
               if eval "$@"; then
-                echo "✅ 成功！"
                 return 0
               else
-                exit_code=$?
-                echo "⚠️ 失败 (exit code: $exit_code)"
-                if [ $attempt -lt $max_attempts ]; then
-                  echo "等待 5 秒后重试..."
-                  sleep 5
-                fi
-                attempt=$((attempt + 1))
+                echo "⚠️ 失败，等待 5 秒后重试..."
+                sleep 5
               fi
+              attempt=$((attempt + 1))
             done
-            
-            echo "❌ 所有 $max_attempts 次尝试均失败"
-            return $exit_code
+            return 1
           }
           
           retry "git pull upstream $UPSTREAM_BRANCH --no-edit" || {
@@ -415,7 +408,7 @@ jobs:
         id: check_releases
         if: github.event.inputs.skip_release_sync != 'true'
         env:
-          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
           UPSTREAM_REPO="${{ steps.detect_upstream.outputs.upstream_repo }}"
           SYNC_LATEST_ONLY="${{ github.event.inputs.sync_latest_only || env.SYNC_LATEST_ONLY }}"
@@ -455,10 +448,6 @@ jobs:
             
             ASSET_COUNT=$(echo "$RELEASES" | jq '.[0].assets | length')
             echo "📦 制品数量: $ASSET_COUNT"
-            
-            if [ "$ASSET_COUNT" -eq 0 ]; then
-              echo "⚠️ 警告: 最新 Release 没有制品文件！"
-            fi
           else
             RELEASES="$ALL_RELEASES"
             RELEASE_COUNT="$TOTAL_COUNT"
@@ -468,22 +457,21 @@ jobs:
           echo "release_count=$RELEASE_COUNT" >> $GITHUB_OUTPUT
 
       # ============================================
-      # 步骤10: 同步 Releases（使用 PAT 推送 + 重试）
+      # 步骤10: 同步 Releases（使用 PAT 推送）
       # ============================================
       - name: 📦 同步 Releases 与制品
         id: sync_releases
         if: github.event.inputs.skip_release_sync != 'true'
         env:
-          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
           set -e
           
           SYNC_MODE="${{ github.event.inputs.sync_mode_override || env.SYNC_MODE }}"
           CURRENT_REPO="${{ github.repository }}"
           RELEASE_COUNT="${{ steps.check_releases.outputs.release_count }}"
-          TOKEN="${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}"
+          TOKEN="${{ secrets.PAT_TOKEN }}"
           
-          # 重试函数
           retry() {
             local max_attempts=3
             local attempt=1
@@ -539,16 +527,14 @@ jobs:
             echo "   制品数量: $ASSET_COUNT"
             echo "=========================================="
             
-            # --- 处理 Tag（使用 PAT 强制推送） ---
+            # --- 处理 Tag ---
             echo "   📌 从上游同步 Tag..."
             
-            # 删除本地 Tag（如果存在）
             if git rev-parse "refs/tags/$TAG_NAME" >/dev/null 2>&1; then
               echo "   🗑️ 删除本地 Tag"
               git tag -d "$TAG_NAME"
             fi
             
-            # 从上游 fetch Tag（带重试）
             retry "git fetch upstream 'refs/tags/$TAG_NAME:refs/tags/$TAG_NAME' --force" 2>/dev/null || {
               echo "   ⚠️ 无法直接 fetch Tag，通过 SHA 创建..."
               if [ "$TARGET_SHA" == "null" ] || [ -z "$TARGET_SHA" ]; then
@@ -558,11 +544,23 @@ jobs:
               git tag -f "$TAG_NAME" "$TARGET_SHA"
             }
             
-            # 使用 PAT 强制推送 Tag（带重试）
-            echo "   📤 推送 Tag 到 origin..."
-            retry "git push 'https://${TOKEN}@github.com/${CURRENT_REPO}' 'refs/tags/${TAG_NAME}' -f" || {
+            # --- 使用 PAT 推送 Tag ---
+            echo "   📤 使用 PAT 推送 Tag 到 origin..."
+            PUSH_URL="https://${TOKEN}@github.com/${CURRENT_REPO}"
+            
+            retry "git push '$PUSH_URL' 'refs/tags/${TAG_NAME}' -f" || {
               echo "   ❌ Tag 推送失败"
-              echo "   请确保 PAT_TOKEN 有 repo 和 workflow 权限"
+              echo ""
+              echo "   🔍 请检查："
+              echo "   1. PAT_TOKEN 是否有 repo 和 workflow 权限"
+              echo "   2. PAT_TOKEN 是否正确添加到 Secrets"
+              echo "   3. 当前是复刻仓库，确保有推送权限"
+              echo ""
+              echo "   📋 PAT_TOKEN 配置步骤："
+              echo "   1. GitHub Settings → Developer settings → Personal access tokens → Tokens (classic)"
+              echo "   2. Generate new token (classic)"
+              echo "   3. 勾选权限: repo (全部) 和 workflow"
+              echo "   4. 在仓库 Settings → Secrets → Actions 中添加 PAT_TOKEN"
               exit 1
             }
             echo "   ✅ Tag 推送成功"
@@ -621,7 +619,6 @@ jobs:
               
               [ -z "$ASSET_NAME" ] || [ "$ASSET_NAME" == "null" ] && continue
               
-              # 跳过源码包
               if [[ "$ASSET_NAME" == *"Source code"* ]] || [[ "$ASSET_NAME" == *"源码"* ]]; then
                 echo "     ⏭️ 跳过源码包: $ASSET_NAME"
                 continue
@@ -661,7 +658,7 @@ jobs:
       - name: ✅ 验证同步结果
         if: github.event.inputs.skip_release_sync != 'true'
         env:
-          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
           echo "=========================================="
           echo "✅ 验证同步结果"
@@ -678,10 +675,6 @@ jobs:
           if [ "$RELEASE_COUNT" -gt 0 ]; then
             echo "📌 Release 列表:"
             echo "$RELEASES" | jq -r '.[] | "   - \(.tag_name) - 制品数: \(.assets | length)"'
-            
-            echo ""
-            echo "📦 制品详情:"
-            echo "$RELEASES" | jq -r '.[] | "   \(.tag_name): " + (.assets | map(.name) | join(", "))'
           fi
 
       # ============================================
