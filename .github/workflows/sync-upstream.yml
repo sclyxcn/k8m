@@ -159,28 +159,28 @@ jobs:
           fi
 
       # ============================================
-      # 步骤4: 配置 Git
+      # 步骤4: 配置 Git（不设置 extraheader）
       # ============================================
       - name: ⚙️ 配置 Git
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          # 配置 Git 只使用 GITHUB_TOKEN
-          git config --global http.https://github.com/.extraheader "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}"
+          # 重要：不要设置 http.extraheader，避免冲突
           echo "✅ Git 配置完成"
 
       # ============================================
-      # 步骤5: 添加上游仓库（只获取 Tags，不同步 workflows）
+      # 步骤5: 添加上游仓库（使用 GITHUB_TOKEN 内嵌在 URL）
       # ============================================
       - name: 🔗 添加上游仓库
         run: |
           UPSTREAM_REPO="${{ steps.detect_upstream.outputs.upstream_repo }}"
-          UPSTREAM_URL="https://github.com/${UPSTREAM_REPO}.git"
+          # 使用 GITHUB_TOKEN 内嵌在 URL 中，不设置 extraheader
+          UPSTREAM_URL="https://${{ secrets.GITHUB_TOKEN }}@github.com/${UPSTREAM_REPO}.git"
           
           echo "上游仓库: $UPSTREAM_REPO"
           git remote add upstream $UPSTREAM_URL || git remote set-url upstream $UPSTREAM_URL
           
-          # 【关键】只 fetch tags，不 fetch 代码
+          # 只 fetch tags，不 fetch 代码
           git fetch upstream --tags --prune --force
           
           echo "✅ 上游仓库添加成功"
@@ -237,7 +237,7 @@ jobs:
           echo "✅ 清理完成，删除 $DELETED_COUNT 个旧 Tags"
 
       # ============================================
-      # 步骤7: 禁用上游 Actions（可选）
+      # 步骤7: 禁用上游 Actions
       # ============================================
       - name: 🚫 禁用上游 Actions
         if: github.event.inputs.disable_upstream_actions == 'true'
@@ -273,7 +273,7 @@ jobs:
           fi
 
       # ============================================
-      # 步骤8: 检查上游 Release（只同步最新的）
+      # 步骤8: 检查上游 Release
       # ============================================
       - name: 🔍 检查上游 Release
         id: check_releases
@@ -315,7 +315,7 @@ jobs:
           echo "release_count=$RELEASE_COUNT" >> $GITHUB_OUTPUT
 
       # ============================================
-      # 步骤9: 同步 Releases（不同步 workflows 文件）
+      # 步骤9: 同步 Releases
       # ============================================
       - name: 📦 同步 Releases 与制品
         if: github.event.inputs.skip_release_sync != 'true'
@@ -357,33 +357,25 @@ jobs:
             echo "   制品数量: $ASSET_COUNT"
             echo "=========================================="
             
-            # --- 处理 Tag（从上游直接获取，不同步代码） ---
+            # --- 处理 Tag ---
             echo "   📌 从上游同步 Tag..."
             
-            # 删除本地 Tag（如果存在）
             if git rev-parse "refs/tags/$TAG_NAME" >/dev/null 2>&1; then
               git tag -d "$TAG_NAME"
             fi
             
-            # 从上游获取 Tag（只获取 Tag 对象，不获取代码）
             git fetch upstream "refs/tags/$TAG_NAME:refs/tags/$TAG_NAME" --force
             
-            # 【关键】推送 Tag 到 origin，但不同步 workflows 目录
-            # 使用 --no-verify 跳过 hooks
-            git push origin "refs/tags/$TAG_NAME" -f --no-verify 2>&1 || {
-              # 如果还是失败，尝试只推送 Tag 不推送内容
+            # 推送 Tag（使用 --no-verify 避免 workflows 权限问题）
+            git push origin "refs/tags/$TAG_NAME" -f --no-verify || {
               echo "   ⚠️ Tag 推送失败，尝试备用方式..."
-              git push origin "refs/tags/$TAG_NAME" -f --no-verify --no-thin 2>&1 || {
-                echo "   ⚠️ 备用方式也失败，尝试创建新 Tag 指向当前 commit"
-                # 获取当前 HEAD 的 commit
-                CURRENT_SHA=$(git rev-parse HEAD)
-                git tag -f "$TAG_NAME" "$CURRENT_SHA"
-                git push origin "refs/tags/$TAG_NAME" -f --no-verify
-              }
+              CURRENT_SHA=$(git rev-parse HEAD)
+              git tag -f "$TAG_NAME" "$CURRENT_SHA"
+              git push origin "refs/tags/$TAG_NAME" -f --no-verify
             }
             echo "   ✅ Tag 推送成功"
             
-            # --- 处理 Release（通过 API） ---
+            # --- 处理 Release ---
             RELEASE_EXISTS=$(curl -s -o /dev/null -w "%{http_code}" \
               -H "Authorization: token $GITHUB_TOKEN" \
               "https://api.github.com/repos/$CURRENT_REPO/releases/tags/$TAG_NAME")
